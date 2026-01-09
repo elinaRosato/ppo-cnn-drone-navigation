@@ -32,21 +32,67 @@ source venv/bin/activate  # Linux/Mac
 pip install -r requirements.txt
 ```
 
-### Training
+### PX4 Setup (Required for Training)
 
-1. **Configure AirSim** (`C:\Users\Dator\Documents\AirSim\settings.json`):
+1. **Install WSL2 and Ubuntu** (Windows only):
+```bash
+wsl --install
+```
+
+2. **Install PX4-Autopilot in Ubuntu**:
+```bash
+# In WSL/Ubuntu terminal
+git clone https://github.com/PX4/PX4-Autopilot.git --recursive
+cd PX4-Autopilot
+bash ./Tools/setup/ubuntu.sh
+```
+
+3. **Get your Windows host IP from WSL**:
+```bash
+ip route show | grep -i default | awk '{ print $3}'
+# Example output: 172.22.32.1
+```
+
+4. **Configure AirSim** (`C:\Users\Dator\Documents\AirSim\settings.json`):
+
+Copy the `settings_sample.json` from this repository to your AirSim settings folder, or use the configuration below:
+
 ```json
 {
   "SettingsVersion": 1.2,
   "SimMode": "Multirotor",
-  "ClockSpeed": 5.0
+  "ClockSpeed": 5.0,
+  "Vehicles": {
+    "PX4": {
+      "VehicleType": "PX4Multirotor",
+      "LocalHostIp": "0.0.0.0",
+      "UseTcp": true,
+      "TcpPort": 4560
+    }
+  }
 }
 ```
 
-2. **Launch AirSim**: Double-click `Blocks.exe` from file explorer
+**Note**: `LocalHostIp: "0.0.0.0"` allows WSL to connect to AirSim on Windows. A complete example configuration is available in `settings_sample.json` in this repository.
 
-3. **Start training with baby steps curriculum** (Recommended):
+### Training
+
+1. **Start PX4 in WSL** (replace with your Windows IP from step 3):
 ```bash
+cd ~/PX4-Autopilot
+PX4_SIM_HOSTNAME=172.22.32.1 make px4_sitl_default none_iris
+```
+
+Wait for: `INFO [simulator_mavlink] Waiting for simulator to accept connection on TCP port 4560`
+
+2. **Launch AirSim**: Open Unreal Editor and hit Play
+
+You should see: `INFO [simulator_mavlink] Simulator connected on TCP port 4560`
+
+3. **Activate Python environment and start training**:
+```bash
+cd C:\Users\Dator\Sites\uav-simulation-training
+venv\Scripts\activate
 python train_ppo_v3_baby_steps.py
 ```
 

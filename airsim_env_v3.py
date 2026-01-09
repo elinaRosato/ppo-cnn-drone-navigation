@@ -540,56 +540,43 @@ class AirSimDroneEnv(gym.Env):
 
                 self.previous_xy_distance = xy_distance
 
-            # Forward velocity reward: encourage moving toward goal (where camera can see)
-            # Penalize backward movement (flying blind)
+            # CAMERA-FIRST MOVEMENT REWARDS
+            # Reward moving in the direction the camera is pointing (forward)
+            # Punish lateral (sideways) or backward movement
+            # This forces drone to rotate first, then move forward - camera always sees ahead!
             if hasattr(self, 'previous_position'):
+                # Get drone's current facing direction
+                state = self.client.getMultirotorState()
+                orientation = state.kinematics_estimated.orientation
+                import math
+                yaw = math.atan2(
+                    2.0 * (orientation.w_val * orientation.z_val + orientation.x_val * orientation.y_val),
+                    1.0 - 2.0 * (orientation.y_val * orientation.y_val + orientation.z_val * orientation.z_val)
+                )
+
                 # Calculate actual movement vector
                 movement = position - self.previous_position
                 movement_xy = movement[:2]  # Only XY movement
 
-                # Direction to goal
-                to_goal = self.goal_pos - position
-                to_goal_xy = to_goal[:2]
+                # Drone's facing direction (where camera points)
+                facing_direction = np.array([np.cos(yaw), np.sin(yaw)])
+                # Perpendicular direction (for lateral movement)
+                lateral_direction = np.array([-np.sin(yaw), np.cos(yaw)])
 
-                # Normalize to get direction (avoid division by zero)
-                goal_distance_xy = np.linalg.norm(to_goal_xy)
-                if goal_distance_xy > 0.1:  # Only if goal is not super close
-                    goal_direction = to_goal_xy / goal_distance_xy
+                # Decompose movement into forward and lateral components
+                forward_velocity = np.dot(movement_xy, facing_direction)
+                lateral_velocity = abs(np.dot(movement_xy, lateral_direction))
 
-                    # Dot product: positive = moving toward goal, negative = moving away
-                    forward_velocity = np.dot(movement_xy, goal_direction)
+                # FORWARD movement (camera sees ahead): REWARD
+                if forward_velocity > 0:
+                    reward += forward_velocity * 8.0  # Strong reward for moving forward
+                else:
+                    # BACKWARD movement (flying blind): HEAVY PENALTY
+                    reward += forward_velocity * 15.0  # Negative * 15 = big penalty
 
-                    # Reward forward movement, penalize backward
-                    # This encourages drone to face and move toward goal (using camera vision)
-                    if forward_velocity > 0:
-                        reward += forward_velocity * 5.0  # Bonus for moving toward goal
-                    else:
-                        reward += forward_velocity * 10.0  # Stronger penalty for moving backward
-
-            # Reward for facing toward goal
-            # Get drone orientation
-            state = self.client.getMultirotorState()
-            orientation = state.kinematics_estimated.orientation
-            import math
-            yaw = math.atan2(
-                2.0 * (orientation.w_val * orientation.z_val + orientation.x_val * orientation.y_val),
-                1.0 - 2.0 * (orientation.y_val * orientation.y_val + orientation.z_val * orientation.z_val)
-            )
-
-            # Angle to goal
-            to_goal = self.goal_pos - position
-            yaw_to_goal = np.arctan2(to_goal[1], to_goal[0])
-
-            # How aligned is the drone with the goal?
-            alignment_error = abs(yaw_to_goal - yaw)
-            while alignment_error > np.pi:
-                alignment_error -= 2 * np.pi
-            alignment_error = abs(alignment_error)
-
-            # Reward being aligned with goal (camera pointing toward goal)
-            # Max reward when perfectly aligned, zero when perpendicular
-            alignment_bonus = (1.0 - alignment_error / np.pi) * 3.0
-            reward += alignment_bonus
+                # LATERAL movement (sideways, crabbing): PENALTY
+                # Drone should rotate to face direction, not slide sideways
+                reward -= lateral_velocity * 10.0
         else:
             # OUT OF BOUNDS: No progress rewards at all!
             # This makes out-of-bounds flight completely unviable

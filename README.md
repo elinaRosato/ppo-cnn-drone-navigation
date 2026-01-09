@@ -10,6 +10,25 @@ Deep reinforcement learning system for autonomous drone navigation using PPO and
 - **Altitude Maintenance**: Maintains consistent cruising altitude for efficient flight
 - **Transfer Learning**: Trained in simulation, deployable to different environments
 
+## SimpleFlight vs PX4
+
+This project supports two flight modes:
+
+**SimpleFlight (Recommended for Training):**
+- AirSim's built-in flight controller
+- Faster training iterations
+- Simpler setup (no WSL/Ubuntu needed)
+- Use `settings_simpleFlight_sample.json`
+
+**PX4 (Recommended for Testing):**
+- Realistic flight controller physics
+- Validates real-world readiness
+- Tests with GPS, sensor noise, and failsafes
+- Use `settings_px4_sample.json`
+- Requires WSL2/Ubuntu on Windows
+
+**Workflow:** Train with SimpleFlight → Test with PX4 → Deploy to real drone
+
 ## Quick Start
 
 ### Setup
@@ -32,7 +51,50 @@ source venv/bin/activate  # Linux/Mac
 pip install -r requirements.txt
 ```
 
-### PX4 Setup (Required for Training)
+### Training
+
+**Training uses SimpleFlight** (AirSim's built-in flight controller) for faster iteration and simpler setup.
+
+1. **Configure AirSim** (`C:\Users\Dator\Documents\AirSim\settings.json`):
+
+Copy `settings_simpleFlight_sample.json` from this repository to your AirSim settings folder:
+
+```bash
+cp settings_simpleFlight_sample.json C:/Users/Dator/Documents/AirSim/settings.json
+```
+
+Or use this minimal configuration:
+```json
+{
+  "SettingsVersion": 1.2,
+  "SimMode": "Multirotor",
+  "ClockSpeed": 5.0
+}
+```
+
+2. **Launch AirSim**: Open Unreal Editor and hit Play
+
+3. **Activate Python environment and start training**:
+```bash
+cd C:\Users\Dator\Sites\uav-simulation-training
+venv\Scripts\activate
+python train_ppo_v3_baby_steps.py
+```
+
+Training time: 6-10 hours for 500k timesteps with ClockSpeed=5
+
+**Note:** Uses ultra-easy curriculum (3m → 35m goals over 300k steps) for faster initial learning.
+
+### Testing
+
+**Quick Test with SimpleFlight:**
+```bash
+python test_ppo_v3.py --model ./models_v3_baby_steps/best_model/best_model.zip
+```
+
+**Testing with PX4 (Optional - For realistic validation):**
+
+After training, you can test your model with PX4 for more realistic flight physics:
 
 1. **Install WSL2 and Ubuntu** (Windows only):
 ```bash
@@ -53,58 +115,29 @@ ip route show | grep -i default | awk '{ print $3}'
 # Example output: 172.22.32.1
 ```
 
-4. **Configure AirSim** (`C:\Users\Dator\Documents\AirSim\settings.json`):
+4. **Configure AirSim for PX4**:
 
-Copy the `settings_sample.json` from this repository to your AirSim settings folder, or use the configuration below:
-
-```json
-{
-  "SettingsVersion": 1.2,
-  "SimMode": "Multirotor",
-  "ClockSpeed": 5.0,
-  "Vehicles": {
-    "PX4": {
-      "VehicleType": "PX4Multirotor",
-      "LocalHostIp": "0.0.0.0",
-      "UseTcp": true,
-      "TcpPort": 4560
-    }
-  }
-}
+Copy `settings_px4_sample.json` to your AirSim settings folder:
+```bash
+cp settings_px4_sample.json C:/Users/Dator/Documents/AirSim/settings.json
 ```
 
-**Note**: `LocalHostIp: "0.0.0.0"` allows WSL to connect to AirSim on Windows. A complete example configuration is available in `settings_sample.json` in this repository.
+**Note**: Update `LocalHostIp: "0.0.0.0"` in the settings to allow WSL to connect to AirSim.
 
-### Training
-
-1. **Start PX4 in WSL** (replace with your Windows IP from step 3):
+5. **Start PX4** (replace with your Windows IP from step 3):
 ```bash
 cd ~/PX4-Autopilot
-PX4_SIM_HOSTNAME=172.22.32.1 make px4_sitl_default none_iris
+PX4_SIM_HOSTNAME=172.22.32.1 COM_ARM_WO_GPS=1 make px4_sitl_default none_iris
 ```
 
-Wait for: `INFO [simulator_mavlink] Waiting for simulator to accept connection on TCP port 4560`
+6. **Launch AirSim**: Open Unreal Editor and hit Play
 
-2. **Launch AirSim**: Open Unreal Editor and hit Play
+7. **Run your test** (modify test script to use `use_px4=True`)
 
-You should see: `INFO [simulator_mavlink] Simulator connected on TCP port 4560`
-
-3. **Activate Python environment and start training**:
-```bash
-cd C:\Users\Dator\Sites\uav-simulation-training
-venv\Scripts\activate
-python train_ppo_v3_baby_steps.py
-```
-
-Training time: 6-10 hours for 500k timesteps with ClockSpeed=5
-
-**Note:** Uses ultra-easy curriculum (3m → 35m goals over 300k steps) for faster initial learning.
-
-### Testing
-
-```bash
-python test_ppo_v3.py --model ./models_v3_quality/best_model/best_model.zip
-```
+**Why test with PX4?**
+- Validates model works with realistic flight controller
+- Tests with GPS, sensor noise, and realistic physics
+- Proves readiness for real-world deployment
 
 ## Project Structure
 

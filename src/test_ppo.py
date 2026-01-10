@@ -1,5 +1,6 @@
 """
-Test trained PPO V3 model for AirSim drone navigation
+Test trained PPO model for AirSim drone navigation
+THIS IS DEPRECATED
 """
 
 import argparse

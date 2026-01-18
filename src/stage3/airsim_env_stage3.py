@@ -20,10 +20,10 @@ class AirSimStage3Env(gym.Env):
     def __init__(self,
                  goal_range_x=(5, 20),
                  goal_range_y=(5, 20),
-                 goal_range_z=(-5, -1),  # Varying altitudes now
+                 goal_range_z=(-20, -10),  # Safe altitude range (10-20m above ground)
                  goal_radius=3.0,
-                 min_altitude=-10.0,
-                 max_altitude=0.0):
+                 min_altitude=-25.0,  # Floor at 25m altitude
+                 max_altitude=-10.0):  # Ceiling at 10m altitude (above Blocks obstacles)
         super(AirSimStage3Env, self).__init__()
 
         self.goal_range_x = goal_range_x
@@ -129,9 +129,9 @@ class AirSimStage3Env(gym.Env):
         vz = float(action[2]) * 0.5  # Slightly more vertical control
         yaw_rate = float(action[3]) * 45.0
 
-        # Move
+        # Move using BODY frame (velocities relative to drone's facing direction)
         yaw_mode = airsim.YawMode(is_rate=True, yaw_or_rate=yaw_rate)
-        self.client.moveByVelocityAsync(vx, vy, vz, 0.5, yaw_mode=yaw_mode).join()
+        self.client.moveByVelocityBodyFrameAsync(vx, vy, vz, 0.5, yaw_mode=yaw_mode).join()
 
         obs = self._get_obs()
         position = self._get_position()

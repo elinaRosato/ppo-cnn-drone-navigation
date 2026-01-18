@@ -85,6 +85,140 @@ Training time: 6-10 hours for 500k timesteps with ClockSpeed=5
 
 **Note:** Uses ultra-easy curriculum (3m → 35m goals over 300k steps) for faster initial learning.
 
+## Staged Training System
+
+The project includes a progressive staged training system located in `src/stage1/`, `src/stage2/`, `src/stage3/`, and `src/stage4/`. Each stage builds upon the previous one, adding complexity incrementally.
+
+### Training Stages Overview
+
+| Stage | Script | Goal | Default Steps |
+|-------|--------|------|---------------|
+| 1 | `train_stage1_forward.py` | Learn forward movement | 50,000 |
+| 2 | `train_stage2_goals.py` | Add goal seeking | 200,000 |
+| 3 | `train_stage3_altitude.py` | Add altitude constraints | 250,000 |
+| 4 | `train_stage4_obstacles.py` | Add obstacle avoidance | 300,000 |
+
+### How Staged Training Works
+
+Each stage:
+1. Loads the final model from the previous stage (if available)
+2. Trains on a new environment with added complexity
+3. Saves checkpoints every N steps
+4. Creates timestamped run folders to preserve all training attempts
+
+### Running Training Scripts
+
+**Start a new training run:**
+```bash
+cd src/stage1
+python train_stage1_forward.py
+```
+
+**Resume from the latest checkpoint:**
+```bash
+python train_stage1_forward.py --resume
+```
+
+**Train for a specific number of total steps:**
+```bash
+python train_stage1_forward.py --steps 100000
+```
+
+**Combine flags (resume and train to 100k total):**
+```bash
+python train_stage1_forward.py --resume --steps 100000
+```
+
+### Command Line Flags
+
+| Flag | Description | Example |
+|------|-------------|---------|
+| `--resume` | Resume from the latest checkpoint in the most recent run | `--resume` |
+| `--steps N` | Set target total timesteps (overrides default) | `--steps 100000` |
+
+### Folder Structure
+
+Each training run creates timestamped folders to preserve all training attempts:
+
+```
+models_stage1/
+  run_2026-01-10_14-30-00/       # First training attempt
+    checkpoints/
+      stage1_forward_10000_steps.zip
+      stage1_forward_20000_steps.zip
+      ...
+    stage1_forward_final.zip
+  run_2026-01-11_09-15-22/       # Second training attempt
+    checkpoints/
+      ...
+    stage1_forward_final.zip
+
+logs_stage1/
+  run_2026-01-10_14-30-00/
+    tensorboard/
+      PPO_1/
+        events.out.tfevents...
+```
+
+### Resume Behavior
+
+When using `--resume`:
+- Finds the **latest run folder** (most recent timestamp)
+- Loads the **highest checkpoint** from that run
+- Continues training from that step count
+- Saves new checkpoints to the **same run folder**
+
+**Example:**
+```
+# First run - trains from 0 to 20k, then interrupted
+python train_stage1_forward.py
+
+# Resume - continues from 20k checkpoint
+python train_stage1_forward.py --resume
+
+Output:
+  Resuming from checkpoint: ./models_stage1/run_2026-01-10_14-30-00/checkpoints/stage1_forward_20000_steps.zip
+  Resuming from step: 20,000
+  Run directory: ./models_stage1/run_2026-01-10_14-30-00
+
+  Target timesteps: 50,000
+  Current progress: 20,000
+  Remaining steps: 30,000
+```
+
+### Extending Training Beyond Default Steps
+
+To train beyond the default target:
+```bash
+# Stage 1 defaults to 50k, train to 100k instead
+python train_stage1_forward.py --steps 100000
+
+# Or resume and extend
+python train_stage1_forward.py --resume --steps 100000
+```
+
+### Stage Progression
+
+After completing each stage, move to the next:
+```bash
+# Complete Stage 1
+cd src/stage1
+python train_stage1_forward.py
+
+# Move to Stage 2 (automatically loads Stage 1 model)
+cd ../stage2
+python train_stage2_goals.py
+
+# Move to Stage 3 (automatically loads Stage 2 model)
+cd ../stage3
+python train_stage3_altitude.py
+```
+
+Each stage script automatically:
+1. Looks for the final model from the previous stage in the latest run folder
+2. Falls back to the old path structure if not found
+3. Creates a new model from scratch if no previous stage model exists (with a warning)
+
 ### Testing
 
 **Quick Test with SimpleFlight:**

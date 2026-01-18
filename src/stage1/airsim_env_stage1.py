@@ -1,6 +1,10 @@
 """
 Stage 1 Environment: Forward Movement Only
 Simplest possible task - just learn to move forward
+
+IMPORTANT: Use an EMPTY environment (no obstacles) for this stage!
+Recommended: Flat terrain or open space in your Unreal project.
+Obstacles are introduced in Stage 4.
 """
 
 import gymnasium as gym
@@ -67,8 +71,10 @@ class AirSimStage1Env(gym.Env):
         self.client.enableApiControl(True)
         self.client.armDisarm(True)
 
-        # Simple takeoff
+        # Takeoff and fly to safe altitude (above obstacles in Blocks environment)
         self.client.takeoffAsync().join()
+        # Move to -15m altitude (15m above ground in NED coordinates)
+        self.client.moveToZAsync(-15, 5).join()  # altitude, velocity
         self.client.hoverAsync().join()
         time.sleep(0.5)
 
@@ -88,9 +94,9 @@ class AirSimStage1Env(gym.Env):
         vz = float(action[2]) * 0.3  # Up/down
         yaw_rate = float(action[3]) * 45.0  # Rotation
 
-        # Move
+        # Move using BODY frame (velocities relative to drone's facing direction)
         yaw_mode = airsim.YawMode(is_rate=True, yaw_or_rate=yaw_rate)
-        self.client.moveByVelocityAsync(vx, vy, vz, 0.5, yaw_mode=yaw_mode).join()
+        self.client.moveByVelocityBodyFrameAsync(vx, vy, vz, 0.5, yaw_mode=yaw_mode).join()
 
         obs = self._get_obs()
         position = self._get_position()

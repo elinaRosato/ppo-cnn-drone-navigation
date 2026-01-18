@@ -69,10 +69,10 @@ class AirSimStage2Env(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        # Random goal (flat, at takeoff altitude)
+        # Random goal (flat, at safe altitude above obstacles)
         goal_x = np.random.uniform(self.goal_range_x[0], self.goal_range_x[1]) * np.random.choice([-1, 1])
         goal_y = np.random.uniform(self.goal_range_y[0], self.goal_range_y[1]) * np.random.choice([-1, 1])
-        goal_z = -2.5  # Fixed altitude for now
+        goal_z = -15.0  # Safe altitude (15m above ground, above Blocks obstacles)
         self.goal_pos = np.array([goal_x, goal_y, goal_z], dtype=np.float32)
 
         distance = np.linalg.norm(self.goal_pos[:2])
@@ -121,9 +121,9 @@ class AirSimStage2Env(gym.Env):
         vz = float(action[2]) * 0.3
         yaw_rate = float(action[3]) * 45.0
 
-        # Move
+        # Move using BODY frame (velocities relative to drone's facing direction)
         yaw_mode = airsim.YawMode(is_rate=True, yaw_or_rate=yaw_rate)
-        self.client.moveByVelocityAsync(vx, vy, vz, 0.5, yaw_mode=yaw_mode).join()
+        self.client.moveByVelocityBodyFrameAsync(vx, vy, vz, 0.5, yaw_mode=yaw_mode).join()
 
         obs = self._get_obs()
         position = self._get_position()

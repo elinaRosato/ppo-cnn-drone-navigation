@@ -17,14 +17,8 @@ train_ppo_v3_curriculum.py
 train_ppo_v3_quality.py
 
 # Training outputs
-models_v3_quality/
-models_v3_fast/
-models_v3_baby_steps/
-models_v3_curriculum/
-logs_v3_quality/
-logs_v3_fast/
-logs_v3_baby_steps/
-logs_v3_curriculum/
+models_stage1/
+logs_stage1/
 
 # IDE
 .vscode/

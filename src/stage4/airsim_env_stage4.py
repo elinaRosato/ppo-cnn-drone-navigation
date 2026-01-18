@@ -132,9 +132,9 @@ class AirSimStage4Env(gym.Env):
         vz = float(action[2]) * 0.5
         yaw_rate = float(action[3]) * 45.0
 
-        # Move
+        # Move using BODY frame (velocities relative to drone's facing direction)
         yaw_mode = airsim.YawMode(is_rate=True, yaw_or_rate=yaw_rate)
-        self.client.moveByVelocityAsync(vx, vy, vz, 0.5, yaw_mode=yaw_mode).join()
+        self.client.moveByVelocityBodyFrameAsync(vx, vy, vz, 0.5, yaw_mode=yaw_mode).join()
 
         obs = self._get_obs()
         position = self._get_position()
@@ -147,8 +147,8 @@ class AirSimStage4Env(gym.Env):
         if collision:
             self.collision_count += 1
             print(f"[COLLISION {self.collision_count}] Hit obstacle at step {self.current_step} | Pos: ({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f})")
-            # Auto-reverse to unstick
-            self.client.moveByVelocityAsync(-1.0, 0, 0, 0.5).join()
+            # Auto-reverse to unstick (body frame - moves backward)
+            self.client.moveByVelocityBodyFrameAsync(-1.0, 0, 0, 0.5).join()
             position = self._get_position()
 
         # Check altitude bounds

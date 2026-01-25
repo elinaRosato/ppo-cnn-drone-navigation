@@ -20,12 +20,14 @@ class AirSimStage2Env(gym.Env):
     def __init__(self,
                  goal_range_x=(5, 20),
                  goal_range_y=(5, 20),
-                 goal_radius=3.0):
+                 goal_radius=3.0,
+                 show_visual_marker=False):  # Disabled by default for realistic training
         super(AirSimStage2Env, self).__init__()
 
         self.goal_range_x = goal_range_x
         self.goal_range_y = goal_range_y
         self.goal_radius = goal_radius
+        self.show_visual_marker = show_visual_marker
         self.img_height = 84
         self.img_width = 84
         self.max_steps = 500
@@ -56,7 +58,7 @@ class AirSimStage2Env(gym.Env):
             'vector': spaces.Box(
                 low=-np.inf,
                 high=np.inf,
-                shape=(19,),  # Full state (13) + goal info (6): rel_x, rel_y, distance, yaw_to_goal, relative_yaw, forward_speed
+                shape=(21,),  # Full state (13) + goal info (6) + altitude info (2) for compatibility with all stages
                 dtype=np.float32
             )
         })
@@ -94,15 +96,16 @@ class AirSimStage2Env(gym.Env):
         self.client.hoverAsync().join()
         time.sleep(0.5)
 
-        # Visual marker
+        # Visual marker (only for debugging, disabled by default)
         self.client.simFlushPersistentMarkers()
-        self.client.simPlotPoints(
-            points=[airsim.Vector3r(float(self.goal_pos[0]), float(self.goal_pos[1]), float(self.goal_pos[2]))],
-            color_rgba=[1.0, 0.0, 0.0, 1.0],
-            size=40,
-            duration=-1,
-            is_persistent=True
-        )
+        if self.show_visual_marker:
+            self.client.simPlotPoints(
+                points=[airsim.Vector3r(float(self.goal_pos[0]), float(self.goal_pos[1]), float(self.goal_pos[2]))],
+                color_rgba=[1.0, 0.0, 0.0, 1.0],
+                size=40,
+                duration=-1,
+                is_persistent=True
+            )
 
         self.current_step = 0
         self.episode_reward = 0.0
@@ -206,20 +209,23 @@ class AirSimStage2Env(gym.Env):
         while relative_yaw < -np.pi:
             relative_yaw += 2 * np.pi
 
-        # Full state vector: drone state (13) + goal info (6)
+        # Full state vector (21 values for compatibility with all stages)
         state_vector = np.array([
-            # Drone state
+            # Drone state (13 values)
             position[0], position[1], position[2],           # Position (3)
             velocity[0], velocity[1], velocity[2],           # Linear velocity (3)
             roll, pitch, yaw,                                # Orientation (3)
             angular_vel[0], angular_vel[1], angular_vel[2],  # Angular velocity (3)
             forward_speed,                                   # Forward speed (1)
-            # Goal information
+            # Goal information (6 values)
             rel_pos[0], rel_pos[1],                         # Relative position to goal (2)
             distance,                                        # Distance to goal (1)
             yaw_to_goal,                                    # Direction to goal (1)
             relative_yaw,                                    # Relative yaw (1)
-            np.dot(velocity[:2], rel_pos[:2]) / (distance + 1e-6)  # Velocity toward goal (1)
+            np.dot(velocity[:2], rel_pos[:2]) / (distance + 1e-6),  # Velocity toward goal (1)
+            # Altitude info placeholders (2 values) - zeros in Stage 2, used in Stage 3+
+            0.0,                                             # Altitude bounds info (1)
+            0.0                                              # Distance to altitude bounds (1)
         ], dtype=np.float32)
 
         return {

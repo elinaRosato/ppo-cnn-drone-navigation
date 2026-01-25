@@ -106,6 +106,22 @@ Each stage:
 3. Saves checkpoints every N steps
 4. Creates timestamped run folders to preserve all training attempts
 
+### Realistic Training (No Visual Markers)
+
+By default, goal markers are **hidden** during training. This ensures the drone learns to navigate using **coordinate inputs** (like GPS), not by visually seeing a target marker.
+
+The drone receives goal information through the observation vector:
+- Relative position to goal (X, Y)
+- Distance to goal
+- Direction to goal (yaw angle)
+- Relative yaw (how much to turn to face goal)
+
+To enable visual markers for **debugging or testing**:
+```python
+# In the environment initialization
+env = AirSimStage2Env(show_visual_marker=True)
+```
+
 ### Running Training Scripts
 
 **Start a new training run:**

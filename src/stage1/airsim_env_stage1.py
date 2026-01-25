@@ -53,7 +53,7 @@ class AirSimStage1Env(gym.Env):
             'vector': spaces.Box(
                 low=-np.inf,
                 high=np.inf,
-                shape=(13,),  # Full state: pos(3), vel(3), orientation(3), angular_vel(3), forward_speed(1)
+                shape=(21,),  # Full state (13) + goal info (6) + altitude info (2) for compatibility with all stages
                 dtype=np.float32
             )
         })
@@ -159,13 +159,23 @@ class AirSimStage1Env(gym.Env):
         facing_direction = np.array([np.cos(yaw), np.sin(yaw)])
         forward_speed = np.dot(velocity[:2], facing_direction)
 
-        # Full state vector
+        # Full state vector (21 values for compatibility with all stages)
         state_vector = np.array([
+            # Drone state (13 values)
             position[0], position[1], position[2],           # Position (3)
             velocity[0], velocity[1], velocity[2],           # Linear velocity (3)
             roll, pitch, yaw,                                # Orientation (3)
             angular_vel[0], angular_vel[1], angular_vel[2],  # Angular velocity (3)
-            forward_speed                                    # Forward speed (1)
+            forward_speed,                                   # Forward speed (1)
+            # Goal info placeholders (6 values) - zeros in Stage 1, used in Stage 2+
+            0.0, 0.0,                                        # Relative position to goal (2)
+            0.0,                                             # Distance to goal (1)
+            0.0,                                             # Direction to goal (1)
+            0.0,                                             # Relative yaw (1)
+            0.0,                                             # Velocity toward goal (1)
+            # Altitude info placeholders (2 values) - zeros in Stage 1-2, used in Stage 3+
+            0.0,                                             # Altitude bounds info (1)
+            0.0                                              # Distance to altitude bounds (1)
         ], dtype=np.float32)
 
         return {

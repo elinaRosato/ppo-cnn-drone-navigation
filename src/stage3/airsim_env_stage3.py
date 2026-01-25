@@ -23,7 +23,8 @@ class AirSimStage3Env(gym.Env):
                  goal_range_z=(-20, -10),  # Safe altitude range (10-20m above ground)
                  goal_radius=3.0,
                  min_altitude=-25.0,  # Floor at 25m altitude
-                 max_altitude=-10.0):  # Ceiling at 10m altitude (above Blocks obstacles)
+                 max_altitude=-10.0,  # Ceiling at 10m altitude (above Blocks obstacles)
+                 show_visual_marker=False):  # Disabled by default for realistic training
         super(AirSimStage3Env, self).__init__()
 
         self.goal_range_x = goal_range_x
@@ -32,6 +33,7 @@ class AirSimStage3Env(gym.Env):
         self.goal_radius = goal_radius
         self.min_altitude = min_altitude
         self.max_altitude = max_altitude
+        self.show_visual_marker = show_visual_marker
         self.img_height = 84
         self.img_width = 84
         self.max_steps = 500
@@ -102,15 +104,16 @@ class AirSimStage3Env(gym.Env):
         self.client.hoverAsync().join()
         time.sleep(0.5)
 
-        # Visual marker for goal
+        # Visual marker for goal (only for debugging, disabled by default)
         self.client.simFlushPersistentMarkers()
-        self.client.simPlotPoints(
-            points=[airsim.Vector3r(float(self.goal_pos[0]), float(self.goal_pos[1]), float(self.goal_pos[2]))],
-            color_rgba=[1.0, 0.0, 0.0, 1.0],
-            size=40,
-            duration=-1,
-            is_persistent=True
-        )
+        if self.show_visual_marker:
+            self.client.simPlotPoints(
+                points=[airsim.Vector3r(float(self.goal_pos[0]), float(self.goal_pos[1]), float(self.goal_pos[2]))],
+                color_rgba=[1.0, 0.0, 0.0, 1.0],
+                size=40,
+                duration=-1,
+                is_persistent=True
+            )
 
         self.current_step = 0
         self.episode_reward = 0.0

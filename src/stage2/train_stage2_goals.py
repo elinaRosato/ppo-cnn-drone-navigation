@@ -142,6 +142,9 @@ def train(resume=False, target_steps=None):
             print(f"\n✅ Loading Stage 1 model from: {stage1_path}")
             model = PPO.load(stage1_path, env=env, device=device)
             model.tensorboard_log = log_dir
+            # Reset timesteps - this is a NEW stage, not a resume
+            model.num_timesteps = 0
+            model._num_timesteps_at_start = 0
             print("✅ Successfully loaded Stage 1 model - will continue learning")
         else:
             print("\n⚠️  Stage 1 model not found!")

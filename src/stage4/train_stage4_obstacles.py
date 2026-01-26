@@ -63,6 +63,9 @@ def train():
     if os.path.exists(stage3_path):
         print(f"\n✅ Loading Stage 3 model from: {stage3_path}")
         model = PPO.load(stage3_path, env=env, device=device)
+        # Reset timesteps - this is a NEW stage, not a resume
+        model.num_timesteps = 0
+        model._num_timesteps_at_start = 0
         print("✅ Successfully loaded Stage 3 model - will continue learning")
     else:
         print(f"\n⚠️  Stage 3 model not found at {stage3_path}")

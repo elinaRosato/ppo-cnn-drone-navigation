@@ -17,8 +17,8 @@ train_ppo_v3_curriculum.py
 train_ppo_v3_quality.py
 
 # Training outputs
-models_stage1/
-logs_stage1/
+models_simplified/
+logs_simplified/
 
 # IDE
 .vscode/
@@ -35,3 +35,4 @@ Thumbs.db
 *.tmp
 *.bak
 *.log
+goal_position.txt

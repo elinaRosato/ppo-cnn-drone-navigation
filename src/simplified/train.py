@@ -89,6 +89,7 @@ def train(resume=False, target_steps=None):
 
                 print(f"\nResuming from checkpoint: {latest_checkpoint}")
                 model = PPO.load(latest_checkpoint, env=env, device=device)
+                model.ent_coef = 0.01
                 model.tensorboard_log = log_dir
                 checkpoint_steps = int(latest_checkpoint.split('_')[-2])
                 model.num_timesteps = checkpoint_steps
@@ -116,7 +117,7 @@ def train(resume=False, target_steps=None):
         model = PPO(
             "CnnPolicy",
             env,
-            learning_rate=3e-4,
+            learning_rate=1e-4,
             n_steps=2048,
             batch_size=64,
             n_epochs=10,

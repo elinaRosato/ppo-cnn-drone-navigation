@@ -60,8 +60,9 @@ def fly_to_waypoint(client, model, waypoint, base_speed=1.0,
     """
     Fly to a single waypoint using controller + trained model.
 
-    Controller: yaws toward waypoint, flies forward at base_speed
-    Model: lateral + vertical correction in body frame
+    Controller: flies toward waypoint at base_speed
+    Model: lateral + vertical correction (perpendicular to goal direction)
+    Yaw: faces actual movement direction
     """
     waypoint = np.array(waypoint, dtype=np.float32)
     collisions = 0
@@ -76,7 +77,7 @@ def fly_to_waypoint(client, model, waypoint, base_speed=1.0,
         # Current position
         position = get_position(client)
 
-        # Controller: yaw toward waypoint
+        # Direction toward waypoint
         dx = waypoint[0] - position[0]
         dy = waypoint[1] - position[1]
         dist_xy = max(math.sqrt(dx * dx + dy * dy), 0.01)
@@ -85,16 +86,26 @@ def fly_to_waypoint(client, model, waypoint, base_speed=1.0,
         if dist_xy < goal_radius:
             return {'success': True, 'steps': step + 1, 'collisions': collisions}
 
-        yaw_to_goal = math.degrees(math.atan2(dy, dx))
-        yaw_mode = airsim.YawMode(is_rate=False, yaw_or_rate=yaw_to_goal)
+        # Unit vector toward goal and perpendicular (left)
+        ux, uy = dx / dist_xy, dy / dist_xy
+        px, py = -uy, ux
 
-        # Model correction (body frame)
+        # Model correction
         lateral = float(action[0]) * lateral_scale
         vertical = float(action[1]) * vertical_scale
 
-        # Body frame velocities
-        body_vx = base_speed
-        body_vy = lateral
+        # Combined velocity: forward toward goal + lateral perpendicular
+        vel_x = base_speed * ux + lateral * px
+        vel_y = base_speed * uy + lateral * py
+        speed_xy = math.sqrt(vel_x * vel_x + vel_y * vel_y)
+
+        # Yaw faces actual movement direction
+        yaw_deg = math.degrees(math.atan2(vel_y, vel_x))
+        yaw_mode = airsim.YawMode(is_rate=False, yaw_or_rate=yaw_deg)
+
+        # Body frame: all horizontal speed is forward, no lateral
+        body_vx = speed_xy
+        body_vy = 0.0
 
         # Altitude hold
         altitude_error = cruising_altitude - position[2]
@@ -102,10 +113,9 @@ def fly_to_waypoint(client, model, waypoint, base_speed=1.0,
 
         # Execute in body frame
         client.moveByVelocityBodyFrameAsync(
-            float(body_vx), float(body_vy), float(body_vz), 2.0,
+            float(body_vx), float(body_vy), float(body_vz), 5.0,
             yaw_mode=yaw_mode
         )
-        time.sleep(0.001)
 
         # Check collision
         if client.simGetCollisionInfo().has_collided:

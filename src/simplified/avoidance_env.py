@@ -4,9 +4,10 @@ Simplified Obstacle Avoidance Environment
 Navigation is handled by a simple controller (go toward goal).
 The RL model ONLY learns obstacle avoidance from the camera image.
 
-Controller: yaws toward goal, flies forward at base_speed
-RL Model:   sees depth camera, outputs lateral + vertical correction (body frame)
-Combined:   body_velocity = (forward, lateral, altitude_hold + vertical)
+Controller: flies forward toward goal at base_speed
+RL Model:   sees depth camera, outputs lateral + vertical correction
+Combined:   velocity = forward_toward_goal + lateral_perpendicular + altitude_hold
+Yaw:        faces actual movement direction (camera sees what's ahead)
 """
 
 import math
@@ -128,20 +129,31 @@ class ObstacleAvoidanceEnv(gym.Env):
 
         position = self._get_position()
 
-        # Controller: yaw toward goal
+        # Controller: direction toward goal
         dx = self.goal_pos[0] - position[0]
         dy = self.goal_pos[1] - position[1]
         dist_xy = max(math.sqrt(dx * dx + dy * dy), 0.01)
-        yaw_to_goal = math.degrees(math.atan2(dy, dx))
-        yaw_mode = airsim.YawMode(is_rate=False, yaw_or_rate=yaw_to_goal)
 
-        # RL model correction (body frame: lateral = left/right, vertical = up/down)
+        # Unit vector toward goal and perpendicular (left)
+        ux, uy = dx / dist_xy, dy / dist_xy
+        px, py = -uy, ux
+
+        # RL model correction
         lateral = float(action[0]) * self.lateral_scale
         vertical = float(action[1]) * self.vertical_scale
 
-        # Body frame velocities: x=forward, y=right, z=down
-        body_vx = self.base_speed
-        body_vy = lateral
+        # Combined velocity: forward toward goal + lateral perpendicular
+        vel_x = self.base_speed * ux + lateral * px
+        vel_y = self.base_speed * uy + lateral * py
+        speed_xy = math.sqrt(vel_x * vel_x + vel_y * vel_y)
+
+        # Yaw faces actual movement direction (camera sees what's ahead)
+        yaw_deg = math.degrees(math.atan2(vel_y, vel_x))
+        yaw_mode = airsim.YawMode(is_rate=False, yaw_or_rate=yaw_deg)
+
+        # Body frame: all horizontal speed is forward, no lateral
+        body_vx = speed_xy
+        body_vy = 0.0
 
         # Altitude hold (don't let model push drone into the ground)
         altitude_error = self.cruising_altitude - position[2]
@@ -153,7 +165,7 @@ class ObstacleAvoidanceEnv(gym.Env):
         # Debug output
         if self.current_step % 25 == 1:
             print(f"  Step {self.current_step}: dist={dist_xy:.1f}m "
-                  f"body=({body_vx:.2f},{body_vy:.2f},{body_vz:.2f}) "
+                  f"vel=({vel_x:.2f},{vel_y:.2f}) body_vx={body_vx:.2f} "
                   f"action=({action[0]:.2f},{action[1]:.2f})")
 
         # Execute movement in body frame (long duration so it persists during camera capture)
@@ -178,20 +190,27 @@ class ObstacleAvoidanceEnv(gym.Env):
         if goal_reached:
             print(f"Goal reached! Steps: {self.current_step}")
 
-        # Reward (collision + action penalty only)
+        # Reward (small magnitudes for stable PPO training)
         reward = 0.0
+        if goal_reached:
+            reward += 10.0
         if collision:
-            reward -= 25.0
-        reward -= float(np.linalg.norm(action)) * 2.0
+            reward -= 10.0
+        reward -= float(np.linalg.norm(action)) * 0.05
 
         self.episode_reward += reward
 
-        # Termination
-        terminated = goal_reached
+        # Termination (collision ends episode immediately)
+        terminated = goal_reached or collision
         truncated = self.current_step >= self.max_steps
 
         if terminated or truncated:
-            reason = "GOAL" if goal_reached else "MAX STEPS"
+            if goal_reached:
+                reason = "GOAL"
+            elif collision:
+                reason = "COLLISION"
+            else:
+                reason = "MAX STEPS"
             print(f"Episode ended ({reason}) | Reward: {self.episode_reward:.2f} | "
                   f"Steps: {self.current_step} | Distance: {new_distance:.1f}m | "
                   f"Collisions: {self.collision_count}")
@@ -219,8 +238,15 @@ class ObstacleAvoidanceEnv(gym.Env):
             depth = np.clip(depth, 0, 100)
             depth = (depth / 100.0 * 255).astype(np.uint8)
             depth_resized = cv2.resize(depth, (self.img_width, self.img_height))
-            return depth_resized[:, :, np.newaxis]
+            img = depth_resized[:, :, np.newaxis]
+
+            # Debug: verify image has meaningful data
+            if self.current_step % 100 == 1:
+                print(f"    [IMG] shape={img.shape} min={img.min()} max={img.max()} mean={img.mean():.1f}")
+
+            return img
         else:
+            print("    [IMG] WARNING: empty image returned!")
             return np.zeros((self.img_height, self.img_width, 1), dtype=np.uint8)
 
     def _get_position(self):

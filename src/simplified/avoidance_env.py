@@ -5,13 +5,17 @@ Navigation is handled by a simple controller (go toward goal).
 The RL model ONLY learns obstacle avoidance from the camera image.
 
 Controller: flies forward toward goal at base_speed
-RL Model:   sees depth camera, outputs lateral + vertical correction
+RL Model:   sees 4 stacked grayscale frames, outputs lateral + vertical correction
 Combined:   velocity = forward_toward_goal + lateral_perpendicular + altitude_hold
 Yaw:        faces actual movement direction (camera sees what's ahead)
+
+Observation: (4, 84, 84) uint8 — 4 stacked grayscale frames, channels-first (CHW)
+             No VecTransposeImage needed; SB3 CnnPolicy detects CHW automatically.
+Depth image: requested alongside RGB in the same API call, used only for the
+             soft proximity penalty reward (not fed to the model).
 """
 
 import math
-import time
 import gymnasium as gym
 from gymnasium import spaces
 import airsim
@@ -46,6 +50,11 @@ class ObstacleAvoidanceEnv(gym.Env):
 
         self.img_height = 84
         self.img_width = 84
+        self.stack_frames = 4
+
+        # Soft proximity penalty: penalise if anything in the centre of the
+        # depth image is closer than this threshold (metres).
+        self.prox_threshold = 5.0
 
         # Connect to AirSim
         self.client = airsim.MultirotorClient()
@@ -55,11 +64,13 @@ class ObstacleAvoidanceEnv(gym.Env):
         self.camera_name = "front_center"
         self.goal_pos = None
 
-        # Observation: Depth camera image (single channel)
+        # Observation: 4 stacked grayscale frames in CHW format.
+        # SB3 CnnPolicy expects (C, H, W); first dim (4) < spatial dims (84)
+        # so SB3 detects this as already channels-first and skips transposition.
         self.observation_space = spaces.Box(
             low=0,
             high=255,
-            shape=(self.img_height, self.img_width, 1),
+            shape=(self.stack_frames, self.img_height, self.img_width),
             dtype=np.uint8
         )
 
@@ -71,9 +82,12 @@ class ObstacleAvoidanceEnv(gym.Env):
             dtype=np.float32
         )
 
+        self.frame_stack = np.zeros(
+            (self.stack_frames, self.img_height, self.img_width), dtype=np.uint8
+        )
+        self.prev_action = np.zeros(2, dtype=np.float32)
         self.current_step = 0
         self.episode_reward = 0.0
-        self.previous_distance = None
         self.collision_count = 0
 
     def reset(self, seed=None, options=None):
@@ -89,7 +103,6 @@ class ObstacleAvoidanceEnv(gym.Env):
 
         print(f"\nGoal: ({goal_x:.1f}, {goal_y:.1f}, {goal_z:.1f})")
 
-        # Write goal for monitor script
         try:
             with open("goal_position.txt", "w") as f:
                 f.write(f"{goal_x} {goal_y} {goal_z}")
@@ -103,7 +116,6 @@ class ObstacleAvoidanceEnv(gym.Env):
         self.client.takeoffAsync().join()
         self.client.moveToZAsync(self.cruising_altitude, 2.0).join()
 
-        # Visual marker
         if self.show_visual_marker:
             self.client.simFlushPersistentMarkers()
             self.client.simPlotPoints(
@@ -117,28 +129,33 @@ class ObstacleAvoidanceEnv(gym.Env):
         self.current_step = 0
         self.episode_reward = 0.0
         self.collision_count = 0
+        self.prev_action = np.zeros(2, dtype=np.float32)
 
-        position = self._get_position()
-        self.previous_distance = np.linalg.norm(position[:2] - self.goal_pos[:2])
+        # Fill the frame stack with the first captured frame (no motion yet)
+        initial_gray, _ = self._get_images()
+        for i in range(self.stack_frames):
+            self.frame_stack[i] = initial_gray
 
-        obs = self._get_camera_image()
-        return obs, {}
+        return self.frame_stack.copy(), {}
 
     def step(self, action):
         self.current_step += 1
 
+        # Action smoothing: 50% blend with previous action.
+        # Prevents abrupt velocity reversals and stabilises AirSim physics.
+        action = 0.5 * np.array(action, dtype=np.float32) + 0.5 * self.prev_action
+        self.prev_action = action.copy()
+
         position = self._get_position()
 
-        # Controller: direction toward goal
+        # Controller: unit vector toward goal and perpendicular (left)
         dx = self.goal_pos[0] - position[0]
         dy = self.goal_pos[1] - position[1]
         dist_xy = max(math.sqrt(dx * dx + dy * dy), 0.01)
-
-        # Unit vector toward goal and perpendicular (left)
         ux, uy = dx / dist_xy, dy / dist_xy
         px, py = -uy, ux
 
-        # RL model correction
+        # RL correction mapped to world frame
         lateral = float(action[0]) * self.lateral_scale
         vertical = float(action[1]) * self.vertical_scale
 
@@ -147,35 +164,34 @@ class ObstacleAvoidanceEnv(gym.Env):
         vel_y = self.base_speed * uy + lateral * py
         speed_xy = math.sqrt(vel_x * vel_x + vel_y * vel_y)
 
-        # Yaw faces actual movement direction (camera sees what's ahead)
+        # Yaw faces actual movement direction so camera sees what's ahead
         yaw_deg = math.degrees(math.atan2(vel_y, vel_x))
         yaw_mode = airsim.YawMode(is_rate=False, yaw_or_rate=yaw_deg)
 
-        # Body frame: all horizontal speed is forward, no lateral
+        # Body frame: all horizontal speed is forward, no lateral slip
         body_vx = speed_xy
         body_vy = 0.0
 
-        # Altitude hold (don't let model push drone into the ground)
+        # Altitude hold
         altitude_error = self.cruising_altitude - position[2]
         base_vz = float(np.clip(altitude_error * 0.5, -1.0, 1.0))
         body_vz = base_vz + vertical
         if position[2] > self.cruising_altitude + 1.0:
             body_vz = min(body_vz, base_vz)
 
-        # Debug output
         if self.current_step % 25 == 1:
             print(f"  Step {self.current_step}: dist={dist_xy:.1f}m "
                   f"vel=({vel_x:.2f},{vel_y:.2f}) body_vx={body_vx:.2f} "
                   f"action=({action[0]:.2f},{action[1]:.2f})")
 
-        # Execute movement in body frame (long duration so it persists during camera capture)
         self.client.moveByVelocityBodyFrameAsync(
             float(body_vx), float(body_vy), float(body_vz), 5.0,
             yaw_mode=yaw_mode
         )
 
-        # Get observation (drone keeps flying at commanded velocity during capture)
-        obs = self._get_camera_image()
+        # Single API call returns both RGB (for obs) and depth (for penalty)
+        gray, depth = self._get_images()
+        self._update_frame_stack(gray)
 
         # Check collision
         collision = self.client.simGetCollisionInfo().has_collided
@@ -188,66 +204,93 @@ class ObstacleAvoidanceEnv(gym.Env):
         goal_reached = new_distance < self.goal_radius
 
         if goal_reached:
-            print(f"Goal reached! Steps: {self.current_step}")
+            print(f"  Goal reached! Steps: {self.current_step}")
 
-        # Reward (small magnitudes for stable PPO training)
+        # --- Reward ---
         reward = 0.0
+
         if goal_reached:
             reward += 10.0
+
         if collision:
             reward -= 10.0
+
+        # Soft proximity penalty: centre 50% of depth image, threshold self.prox_threshold.
+        # Gives a smooth gradient pushing the drone to stay clear of obstacles,
+        # rather than only penalising at the hard collision boundary.
+        center_depth = depth[
+            self.img_height // 4: 3 * self.img_height // 4,
+            self.img_width  // 4: 3 * self.img_width  // 4
+        ]
+        min_depth_center = float(np.min(center_depth))
+        if min_depth_center < self.prox_threshold:
+            reward -= (self.prox_threshold - min_depth_center) / self.prox_threshold * 2.0
+
+        # Action norm penalty on the smoothed action
         reward -= float(np.linalg.norm(action)) * 0.05
 
         self.episode_reward += reward
 
-        # Termination (collision ends episode immediately)
+        # Termination
         terminated = goal_reached or collision
         truncated = self.current_step >= self.max_steps
 
         if terminated or truncated:
-            if goal_reached:
-                reason = "GOAL"
-            elif collision:
-                reason = "COLLISION"
-            else:
-                reason = "MAX STEPS"
+            reason = "GOAL" if goal_reached else ("COLLISION" if collision else "MAX STEPS")
             print(f"Episode ended ({reason}) | Reward: {self.episode_reward:.2f} | "
                   f"Steps: {self.current_step} | Distance: {new_distance:.1f}m | "
                   f"Collisions: {self.collision_count}")
 
-        self.previous_distance = new_distance
-
-        return obs, reward, terminated, truncated, {
+        return self.frame_stack.copy(), reward, terminated, truncated, {
             'goal_reached': goal_reached,
             'collision': collision,
             'distance': new_distance,
             'collision_count': self.collision_count
         }
 
-    def _get_camera_image(self):
-        """Get depth camera image."""
+    def _get_images(self):
+        """Single API call: RGB scene → grayscale (observation) + raw depth (penalty).
+
+        Depth is returned in raw metres and is NOT normalised — it is used only
+        for computing the proximity reward, never fed to the model.
+        """
         responses = self.client.simGetImages([
-            airsim.ImageRequest(self.camera_name, airsim.ImageType.DepthPerspective, True, False)
+            airsim.ImageRequest(self.camera_name, airsim.ImageType.Scene, False, False),
+            airsim.ImageRequest(self.camera_name, airsim.ImageType.DepthPerspective, True, False),
         ])
 
+        # --- RGB → grayscale ---
         if responses and responses[0].width > 0:
-            # Depth comes as float array
-            depth = airsim.list_to_2d_float_array(responses[0].image_data_float,
-                                                  responses[0].width, responses[0].height)
-            # Clamp and normalize to 0-255
-            depth = np.clip(depth, 0, 100)
-            depth = (depth / 100.0 * 255).astype(np.uint8)
-            depth_resized = cv2.resize(depth, (self.img_width, self.img_height))
-            img = depth_resized[:, :, np.newaxis]
+            r = responses[0]
+            raw = np.frombuffer(r.image_data_uint8, dtype=np.uint8)
+            # AirSim returns BGRA (4 ch) or BGR (3 ch) depending on platform/version
+            n_ch = len(raw) // (r.width * r.height)
+            img = raw.reshape(r.height, r.width, n_ch)
+            gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY if n_ch == 4 else cv2.COLOR_BGR2GRAY)
+            gray = cv2.resize(gray, (self.img_width, self.img_height))
 
-            # Debug: verify image has meaningful data
             if self.current_step % 100 == 1:
-                print(f"    [IMG] shape={img.shape} min={img.min()} max={img.max()} mean={img.mean():.1f}")
-
-            return img
+                print(f"    [IMG] gray shape={gray.shape} "
+                      f"min={gray.min()} max={gray.max()} mean={gray.mean():.1f}")
         else:
-            print("    [IMG] WARNING: empty image returned!")
-            return np.zeros((self.img_height, self.img_width, 1), dtype=np.uint8)
+            print("    [IMG] WARNING: empty RGB image!")
+            gray = np.zeros((self.img_height, self.img_width), dtype=np.uint8)
+
+        # --- Depth (raw metres, penalty only) ---
+        if len(responses) > 1 and responses[1].width > 0:
+            r = responses[1]
+            depth = airsim.list_to_2d_float_array(r.image_data_float, r.width, r.height)
+            depth = cv2.resize(depth, (self.img_width, self.img_height))
+        else:
+            # Fallback: treat everything as far away so no penalty is applied
+            depth = np.full((self.img_height, self.img_width), 100.0, dtype=np.float32)
+
+        return gray, depth
+
+    def _update_frame_stack(self, new_frame):
+        """Shift stack and insert the newest frame at the end (index -1)."""
+        self.frame_stack = np.roll(self.frame_stack, shift=-1, axis=0)
+        self.frame_stack[-1] = new_frame
 
     def _get_position(self):
         state = self.client.getMultirotorState()

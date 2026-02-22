@@ -16,11 +16,10 @@ import os
 import argparse
 from datetime import datetime
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
-from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
 import torch
-import numpy as np
 
 from avoidance_env import ObstacleAvoidanceEnv
 
@@ -56,7 +55,7 @@ def train(resume=False, target_steps=None):
     print("=" * 70)
     print("OBSTACLE AVOIDANCE TRAINING")
     print("=" * 70)
-    print("\nModel input:  Depth image (84x84)")
+    print("\nModel input:  4x grayscale RGB frames (4, 84, 84)")
     print("Model output: Lateral + vertical correction")
     print("Controller:   Flies toward goal automatically")
     print("=" * 70)
@@ -119,8 +118,8 @@ def train(resume=False, target_steps=None):
             env,
             learning_rate=1e-4,
             n_steps=2048,
-            batch_size=64,
-            n_epochs=10,
+            batch_size=256,
+            n_epochs=5,
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
@@ -136,19 +135,6 @@ def train(resume=False, target_steps=None):
         save_freq=20000,
         save_path=os.path.join(run_dir, "checkpoints"),
         name_prefix="simplified_avoidance"
-    )
-
-    eval_env = DummyVecEnv([make_env()])
-    eval_env = VecTransposeImage(eval_env)
-
-    eval_callback = EvalCallback(
-        eval_env,
-        best_model_save_path=os.path.join(run_dir, "best_model"),
-        log_path=os.path.join(run_dir, "eval"),
-        eval_freq=2000,
-        n_eval_episodes=3,
-        deterministic=True,
-        render=False
     )
 
     total_timesteps = target_steps if target_steps else 200_000
@@ -167,7 +153,6 @@ def train(resume=False, target_steps=None):
     if remaining_timesteps <= 0:
         print("Already reached target timesteps! Nothing to train.")
         env.close()
-        eval_env.close()
         return
 
     print("CHECKLIST:")
@@ -180,7 +165,7 @@ def train(resume=False, target_steps=None):
     try:
         model.learn(
             total_timesteps=remaining_timesteps,
-            callback=[checkpoint_callback, eval_callback],
+            callback=checkpoint_callback,
             progress_bar=True,
             reset_num_timesteps=False,
             tb_log_name="avoidance"
@@ -198,7 +183,6 @@ def train(resume=False, target_steps=None):
 
     finally:
         env.close()
-        eval_env.close()
 
 
 if __name__ == "__main__":

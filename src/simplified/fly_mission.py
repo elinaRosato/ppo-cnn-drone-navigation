@@ -29,21 +29,41 @@ MISSION_WAYPOINTS = [
 ]
 
 
-def get_camera_image(client, camera_name="front_center"):
-    """Capture depth image matching training format."""
+STACK_FRAMES = 4
+IMG_SIZE = 84
+
+
+def get_grayscale_frame(client, camera_name="front_center"):
+    """Capture RGB scene image and convert to grayscale (84x84)."""
     responses = client.simGetImages([
-        airsim.ImageRequest(camera_name, airsim.ImageType.DepthPerspective, True, False)
+        airsim.ImageRequest(camera_name, airsim.ImageType.Scene, False, False)
     ])
 
     if responses and responses[0].width > 0:
-        depth = airsim.list_to_2d_float_array(responses[0].image_data_float,
-                                              responses[0].width, responses[0].height)
-        depth = np.clip(depth, 0, 100)
-        depth = (depth / 100.0 * 255).astype(np.uint8)
-        depth_resized = cv2.resize(depth, (84, 84))
-        return depth_resized[:, :, np.newaxis]
+        r = responses[0]
+        raw = np.frombuffer(r.image_data_uint8, dtype=np.uint8)
+        n_ch = len(raw) // (r.width * r.height)
+        img = raw.reshape(r.height, r.width, n_ch)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY if n_ch == 4 else cv2.COLOR_BGR2GRAY)
+        return cv2.resize(gray, (IMG_SIZE, IMG_SIZE))
     else:
-        return np.zeros((84, 84, 1), dtype=np.uint8)
+        return np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.uint8)
+
+
+def init_frame_stack(client, camera_name="front_center"):
+    """Build initial frame stack by repeating the first captured frame."""
+    first = get_grayscale_frame(client, camera_name)
+    stack = np.zeros((STACK_FRAMES, IMG_SIZE, IMG_SIZE), dtype=np.uint8)
+    for i in range(STACK_FRAMES):
+        stack[i] = first
+    return stack
+
+
+def update_frame_stack(stack, new_frame):
+    """Shift stack left and insert the newest frame at the end."""
+    stack = np.roll(stack, shift=-1, axis=0)
+    stack[-1] = new_frame
+    return stack
 
 
 def get_position(client):
@@ -67,12 +87,15 @@ def fly_to_waypoint(client, model, waypoint, base_speed=1.0,
     waypoint = np.array(waypoint, dtype=np.float32)
     collisions = 0
 
-    for step in range(max_steps):
-        # Camera image for model
-        image = get_camera_image(client)
+    # Initialise frame stack matching training format: (4, 84, 84) CHW
+    frame_stack = init_frame_stack(client)
 
-        # Model predicts correction
-        action, _ = model.predict(image, deterministic=True)
+    for step in range(max_steps):
+        # Update frame stack with latest grayscale frame
+        frame_stack = update_frame_stack(frame_stack, get_grayscale_frame(client))
+
+        # Model predicts correction from stacked frames
+        action, _ = model.predict(frame_stack, deterministic=True)
 
         # Current position
         position = get_position(client)

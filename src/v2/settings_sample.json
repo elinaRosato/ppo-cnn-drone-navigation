@@ -1,0 +1,34 @@
+{
+  "SettingsVersion": 1.2,
+  "SimMode": "Multirotor",
+  "ClockSpeed": 10.0,
+  "Vehicles": {
+    "SimpleFlight": {
+      "VehicleType": "SimpleFlight",
+      "Cameras": {
+        "front_center": {
+          "CaptureSettings": [
+            {
+              "ImageType": 0,
+              "Width": 256,
+              "Height": 256,
+              "FOV_Degrees": 120
+            },
+            {
+              "ImageType": 2,
+              "Width": 256,
+              "Height": 256,
+              "FOV_Degrees": 120
+            }
+          ],
+          "X": 0.50,
+          "Y": 0,
+          "Z": -0.25,
+          "Pitch": 0,
+          "Roll": 0,
+          "Yaw": 0
+        }
+      }
+    }
+  }
+}

@@ -152,7 +152,7 @@ def fly_to_waypoint(client, model, waypoint, base_speed=1.0,
     return {'success': False, 'steps': max_steps, 'collisions': collisions}
 
 
-def main(model_path, base_speed=2.0):
+def main(model_path, base_speed=5.0):
     print("=" * 70)
     print("MULTI-WAYPOINT MISSION")
     print("=" * 70)
@@ -235,7 +235,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Fly a multi-waypoint mission')
     parser.add_argument('--model', type=str, default=None,
                         help='Path to trained model (default: latest)')
-    parser.add_argument('--speed', type=float, default=2.0,
+    parser.add_argument('--speed', type=float, default=5.0,
                         help='Base flight speed in m/s (default: 2.0)')
     args = parser.parse_args()
 

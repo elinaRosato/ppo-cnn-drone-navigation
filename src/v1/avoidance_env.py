@@ -31,10 +31,10 @@ class ObstacleAvoidanceEnv(gym.Env):
     def __init__(self,
                  goal_distance_range=(50, 50),
                  cruising_altitude=-5.0,
-                 base_speed=1.0,
+                 base_speed=5.0,
                  lateral_scale=1.0,
                  vertical_scale=0.5,
-                 goal_radius=1.5,
+                 goal_radius=5.0,
                  max_steps=500,
                  show_visual_marker=False):
         super().__init__()

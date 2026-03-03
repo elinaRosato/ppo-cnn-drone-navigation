@@ -47,8 +47,8 @@ def get_latest_run_dir(base_dir):
 
 
 def train(resume=False, target_steps=None):
-    base_model_dir = "./models_simplified"
-    base_log_dir = "./logs_simplified"
+    base_model_dir = "./models_v2"
+    base_log_dir = "./logs_v2"
     os.makedirs(base_model_dir, exist_ok=True)
     os.makedirs(base_log_dir, exist_ok=True)
 

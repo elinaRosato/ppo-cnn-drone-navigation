@@ -17,8 +17,8 @@ train_ppo_v3_curriculum.py
 train_ppo_v3_quality.py
 
 # Training outputs
-models_simplified/
-logs_simplified/
+models_v1/
+logs_v1/
 
 # IDE
 .vscode/

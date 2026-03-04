@@ -41,7 +41,8 @@ class ObstacleAvoidanceEnv(gym.Env):
                  lateral_scale=1.0,
                  vertical_scale=0.5,
                  goal_radius=5.0,
-                 max_steps=500,
+                 max_steps=2000,
+                 step_hz=30.0,
                  show_visual_marker=False,
                  ros2_bridge=None):
         super().__init__()
@@ -53,6 +54,7 @@ class ObstacleAvoidanceEnv(gym.Env):
         self.vertical_scale = vertical_scale
         self.goal_radius = goal_radius
         self.max_steps = max_steps
+        self.step_hz = step_hz
         self.show_visual_marker = show_visual_marker
         self.ros2_bridge = ros2_bridge
 
@@ -239,6 +241,16 @@ class ObstacleAvoidanceEnv(gym.Env):
 
         t_step_total = time.perf_counter() - t_step_start
 
+        # Rate-limit to step_hz when using the ROS2 bridge so the training loop
+        # matches real deployment frequency (default 30 Hz) and the frame stack
+        # captures genuinely different frames rather than repeated cache reads.
+        if self.ros2_bridge is not None and self.step_hz is not None:
+            target = 1.0 / self.step_hz
+            remaining = target - t_step_total
+            if remaining > 0:
+                time.sleep(remaining)
+        t_step_wall = time.perf_counter() - t_step_start
+
         if self.current_step % 25 == 1:
             print(f"  Step {self.current_step}: dist={dist_xy:.1f}m "
                   f"speed={self.episode_speed:.1f}m/s "
@@ -248,8 +260,8 @@ class ObstacleAvoidanceEnv(gym.Env):
                   f"images={t_images*1000:.1f} "
                   f"collision={t_collision*1000:.1f} "
                   f"pos2={t_get_pos2*1000:.1f} "
-                  f"total={t_step_total*1000:.1f} "
-                  f"(~{1/t_step_total:.1f} Hz)")
+                  f"compute={t_step_total*1000:.1f} "
+                  f"(~{1/t_step_wall:.1f} Hz)")
 
         if goal_reached:
             print(f"  Goal reached! Steps: {self.current_step}")

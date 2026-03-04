@@ -19,6 +19,8 @@ train_ppo_v3_quality.py
 # Training outputs
 models_v1/
 logs_v1/
+models_v2/
+logs_v2/
 
 # IDE
 .vscode/

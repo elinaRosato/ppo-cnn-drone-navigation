@@ -57,7 +57,8 @@ wsl --install
 This installs WSL2 with Ubuntu by default. Restart when prompted.
 
 After restart, open the Ubuntu terminal from the Start menu and complete the
-initial user setup (username + password).
+initial user setup (username + password). **Save this password** — you will
+need it for `sudo` commands throughout this guide.
 
 Verify WSL2 is the default version:
 
@@ -66,11 +67,22 @@ wsl --set-default-version 2
 wsl -l -v   # should show Ubuntu with VERSION 2
 ```
 
+> **Forgotten password?** Log in as root without a password and reset it:
+> ```powershell
+> wsl -d Ubuntu-22.04 -u root
+> ```
+> Then inside WSL2:
+> ```bash
+> cat /etc/passwd | grep /home   # find your username
+> passwd yourname                # set a new password
+> exit
+> ```
+
 ---
 
 ## Step 2: Install ROS2 Humble in WSL2
 
-Open the Ubuntu WSL2 terminal and run the official install:
+Open the Ubuntu WSL2 terminal and run:
 
 ```bash
 # Set locale
@@ -86,9 +98,21 @@ echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-a
   http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" \
   | sudo tee /etc/apt/sources.list.d/ros2.list > /dev/null
 
-# Install ROS2 Humble
+# Install ROS2 Humble + all packages needed by airsim_ros_pkgs
 sudo apt update
-sudo apt install -y ros-humble-desktop python3-colcon-common-extensions python3-rosdep
+sudo apt install -y \
+  ros-humble-desktop \
+  python3-colcon-common-extensions \
+  python3-rosdep \
+  ros-humble-cv-bridge \
+  ros-humble-image-transport \
+  ros-humble-mavros-msgs \
+  ros-humble-geographic-msgs \
+  ros-humble-tf2 \
+  ros-humble-tf2-ros \
+  ros-humble-tf2-geometry-msgs \
+  ros-humble-tf2-sensor-msgs \
+  ros-humble-tf2-eigen
 
 # Source ROS2 in every new shell
 echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc
@@ -99,30 +123,84 @@ sudo rosdep init
 rosdep update
 ```
 
+> **`rosdep install` warning about `message_runtime`** is harmless — it is a
+> ROS1 package name left in AirSim's `package.xml`. Ignore it and continue.
+
 ---
 
 ## Step 3: Build AirSim from Source in WSL2
 
 The ROS2 bridge (`airsim_ros_pkgs`) is only available by building from source.
 
-```bash
-# Dependencies
-sudo apt install -y \
-  build-essential cmake git \
-  ros-humble-cv-bridge ros-humble-image-transport \
-  ros-humble-mavros-msgs ros-humble-geographic-msgs
+### 3a. Install build dependencies and clone
 
-# Clone AirSim
+```bash
+sudo apt install -y build-essential cmake git
+
 cd ~
 git clone https://github.com/microsoft/AirSim.git
 cd AirSim
+```
 
-# Build AirSim core libraries (needed by the ROS2 package)
+### 3b. Patch setup.sh for Ubuntu 22.04
+
+Two package names changed in Ubuntu 22.04 and are not available under their
+old names:
+
+```bash
+# vulkan-utils was renamed to vulkan-tools
+# clang-8 is not available; use clang-12
+sudo sed -i \
+  's/vulkan-utils/vulkan-tools/g;
+   s/clang-8/clang-12/g;
+   s/clang++-8/clang++-12/g;
+   s/libc++-8-dev/libc++-12-dev/g;
+   s/libc++abi-8-dev/libc++abi-12-dev/g' \
+  ~/AirSim/setup.sh
+
 ./setup.sh
+```
+
+### 3c. Patch build.sh for Ubuntu 22.04
+
+`build.sh` also hardcodes `clang-8`:
+
+```bash
+sed -i 's/clang-8/clang-12/g; s/clang++-8/clang++-12/g' ~/AirSim/build.sh
 ./build.sh
 ```
 
-Then build the ROS2 package:
+> **`build.sh` exits with Error 2** near the end (after 82% — non-AirLib
+> targets fail to compile with clang-12). This is fine. The only file the
+> ROS2 package needs is `build_release/output/lib/libAirLib.a`, which is
+> built successfully. Verify it exists:
+> ```bash
+> ls -lh ~/AirSim/build_release/output/lib/libAirLib.a
+> # should show ~3-4 MB
+> ```
+
+### 3d. Patch the ROS2 CMakeLists.txt for ROS2 Humble include layout
+
+ROS2 Humble changed the include directory layout: each package now has its
+own subdirectory under `/opt/ros/humble/include/`. The AirSim ROS2 package
+was written for Foxy and does not account for this.
+
+```bash
+python3 -c "
+content = open('/home/$USER/AirSim/ros2/src/airsim_ros_pkgs/CMakeLists.txt').read()
+content = content.replace(
+    'include_directories(\${INCLUDE_DIRS})',
+    '# ROS2 Humble: each package has its own include subdir\nfile(GLOB _ros2_includes /opt/ros/humble/include/*)\ninclude_directories(\${INCLUDE_DIRS} \${_ros2_includes})'
+)
+open('/home/$USER/AirSim/ros2/src/airsim_ros_pkgs/CMakeLists.txt', 'w').write(content)
+print('Patched')
+"
+```
+
+> **Important:** replace `$USER` with your actual Linux username if the
+> Python one-liner doesn't expand it automatically (e.g. `/home/elina/...`).
+
+### 3e. Build the ROS2 package
 
 ```bash
 cd ~/AirSim/ros2
@@ -137,24 +215,43 @@ echo "source ~/AirSim/ros2/install/setup.bash" >> ~/.bashrc
 source ~/.bashrc
 ```
 
+The build will print many `-Wdeprecated-copy` warnings from Eigen — these are
+harmless. A successful build ends with:
+```
+Summary: 2 packages finished [~2 min]
+  1 package had stderr output: airsim_ros_pkgs
+```
+(stderr output = warnings only, not errors)
+
 ---
 
 ## Step 4: Install Python Dependencies in WSL2
 
+> **NumPy version constraint:** `cv_bridge` (installed by apt as part of
+> ROS2 Humble) was compiled against NumPy 1.x. Installing NumPy 2.x via pip
+> will cause an `AttributeError: _ARRAY_API not found` at runtime.
+
 ```bash
-# Python deps for training
+# Install msgpack-rpc-python first — airsim's setup.py requires it at
+# metadata-generation time, so it must be present before airsim is installed
+pip install msgpack-rpc-python
+
+# Install remaining deps; pin numpy below 2.0
 pip install \
   airsim \
   gymnasium \
-  stable-baselines3[extra] \
+  "stable-baselines3[extra]" \
   opencv-python \
-  numpy \
-  torch torchvision   # or install the CUDA build from pytorch.org
-
-# cv_bridge Python bindings (already installed via ROS2 apt above,
-# but make sure it's accessible in your Python environment)
-sudo apt install -y python3-cv-bridge
+  "numpy<2" \
+  torch torchvision
 ```
+
+> **`numpy<2` vs opencv-python 4.13 conflict warning** is expected and
+> harmless. opencv-python 4.13 declares `numpy>=2` as a requirement but
+> works correctly for all operations used in this project.
+
+> **`python` not found?** On Ubuntu 22.04, use `python3` instead of `python`
+> for all commands.
 
 ---
 
@@ -203,7 +300,6 @@ WSL2 runs in a virtual network. To connect from WSL2 to AirSim running on
 Windows, you need the Windows host IP as seen from inside WSL2.
 
 ```bash
-# Run this inside WSL2
 export AIRSIM_HOST=$(cat /etc/resolv.conf | grep nameserver | awk '{print $2}')
 echo $AIRSIM_HOST   # typically 172.x.x.x
 ```
@@ -215,23 +311,31 @@ echo 'export AIRSIM_HOST=$(cat /etc/resolv.conf | grep nameserver | awk '"'"'{pr
 source ~/.bashrc
 ```
 
-> **Windows Firewall:** AirSim listens on port 41451. If the connection is
-> refused, add an inbound firewall rule in Windows:
-> Settings → Windows Defender Firewall → Advanced Settings →
-> Inbound Rules → New Rule → Port 41451 → Allow.
+---
+
+## Step 7: Windows Firewall Rule (one-time)
+
+AirSim listens on TCP port 41451. WSL2 connections from Linux will be blocked
+unless an inbound firewall rule is added. Run this in **PowerShell as
+Administrator** on Windows:
+
+```powershell
+New-NetFirewallRule -DisplayName "AirSim" -Direction Inbound -Protocol TCP -LocalPort 41451 -Action Allow
+```
 
 ---
 
-## Step 7: Launch AirSim on Windows
+## Step 8: Launch AirSim on Windows
 
-Start your Unreal Engine project (or a pre-built AirSim binary) on the Windows
-side as normal. Wait for the simulation to fully load before proceeding.
+Start your Unreal Engine project on the Windows side. **Hit Play** in the
+editor before proceeding — AirSim only starts accepting connections once the
+simulation is running.
 
 ---
 
-## Step 8: Launch the ROS2 Bridge in WSL2
+## Step 9: Launch the ROS2 Bridge in WSL2
 
-In a WSL2 terminal:
+In a WSL2 terminal (terminal 1):
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -242,57 +346,38 @@ ros2 launch airsim_ros_pkgs airsim_node.launch.py \
   host:=$AIRSIM_HOST
 ```
 
-You should see log lines like:
+You should see:
 ```
-[airsim_node]: Connected to AirSim!
-[airsim_node]: Publishing image on /airsim_node/SimpleFlight/front_center/Scene
-```
-
-Verify both topics are publishing at the expected rate:
-
-```bash
-# In a second WSL2 terminal
-ros2 topic hz /airsim_node/SimpleFlight/front_center/Scene
-# Expected: ~20-30 Hz
-
-ros2 topic hz /airsim_node/SimpleFlight/front_center/DepthPerspective
-# Expected: ~20-30 Hz
+[airsim_node-2] Connected!
+[airsim_node-2] [INFO] [...] [airsim_node]: AirsimROSWrapper Initialized!
 ```
 
 ---
 
-## Step 9: Run Training in WSL2
+## Step 10: Run Training in WSL2
 
-Open a third WSL2 terminal, navigate to the `src/v2` directory, and run:
+Open a second WSL2 terminal (terminal 2):
 
 ```bash
-cd /path/to/ppo-cnn-drone-navigation/src/v2
+# Windows project files are accessible under /mnt/c/
+cd /mnt/c/Users/<YourName>/Sites/uav-simulation-training/src/v2
 
-# Make sure AIRSIM_HOST is set (if not already in .bashrc)
+# Make sure AIRSIM_HOST is set
 export AIRSIM_HOST=$(cat /etc/resolv.conf | grep nameserver | awk '{print $2}')
 
 # Start training with the ROS2 bridge
-python train.py --ros2
+python3 train.py --ros2
 
 # Optional: specify total steps
-python train.py --ros2 --steps 500000
+python3 train.py --ros2 --steps 500000
 
 # Resume a previous run with the bridge
-python train.py --ros2 --resume
+python3 train.py --ros2 --resume
 ```
-
-The script will:
-1. Start `ROS2CameraBridge` in a background thread
-2. Wait up to 10 seconds for the first frame to arrive
-3. Print the confirmed AirSim connection host
-4. Show the per-step timing breakdown every 25 steps so you can verify the
-   bridge is working (`images=` should be < 5 ms, not ~600 ms)
 
 ---
 
 ## Verifying It Works
-
-Look for these signs in the training output:
 
 **Bridge connected:**
 ```
@@ -301,21 +386,24 @@ ROS2 bridge ready.
 Connected to AirSim at 172.x.x.x!
 ```
 
-**Step timing with bridge active (images < 5 ms):**
+**Step timing with bridge active — `compute` < 10 ms, effective ~30 Hz:**
 ```
-[TIMING ms] pos1=4.1 move=1.0 images=0.3 collision=3.9 pos2=4.2 total=13.5 (~74.1 Hz)
-[IMG-ROS2 ms] rgb_cache=0.1 depth_ros2=0.1
+[TIMING ms] pos1=1.0 move=0.1 images=2.2 collision=0.5 pos2=0.8 compute=4.6 (~29.9 Hz)
+[IMG-ROS2 ms] rgb_cache=0.0 depth_ros2=0.0
 ```
 
-**Step timing without bridge (images ~600 ms):**
+The `compute=` field shows the actual processing time before the 30 Hz rate
+limiter sleep. The Hz shown is the effective wall-clock step rate after
+sleeping.
+
+**Step timing without bridge (Python API fallback):**
 ```
-[TIMING ms] pos1=4.2 move=1.1 images=612.3 collision=3.8 pos2=4.0 total=625.4 (~1.6 Hz)
+[TIMING ms] pos1=4.2 move=1.1 images=612.3 collision=3.8 pos2=4.0 compute=625.4 (~1.6 Hz)
 [IMG-API ms] simGetImages=609.7
 ```
 
-If `depth_ros2` shows as `depth_api` in the output, the depth topic hasn't
-received its first frame yet — this is normal for the first few steps and
-resolves automatically.
+If `depth_ros2` shows as `depth_api` in the first few steps, the depth topic
+hasn't received its first frame yet — this resolves automatically.
 
 ---
 
@@ -323,16 +411,30 @@ resolves automatically.
 
 **`Connection refused` on AirSim Python API:**
 - Check `AIRSIM_HOST` is set correctly and that AirSim is running
-- Add a Windows Firewall inbound rule for TCP port 41451
+- Confirm the Windows Firewall rule for TCP port 41451 exists
+- Confirm Play is active in the Unreal Editor
 
 **ROS2 bridge receives no frames:**
 - Confirm the `airsim_node` launched without errors
 - Confirm `host:=$AIRSIM_HOST` in the launch command matches the Windows IP
 - Run `ros2 topic list` — if the topics don't appear, the bridge isn't connected to AirSim
 
+**`AttributeError: _ARRAY_API not found` in cv_bridge:**
+- NumPy 2.x is installed; downgrade: `pip install "numpy<2"`
+
+**`ModuleNotFoundError: No module named 'msgpackrpc'`:**
+- Install before airsim: `pip install msgpack-rpc-python`
+
 **`ImportError: No module named 'rclpy'`:**
-- Make sure you sourced ROS2 before running: `source /opt/ros/humble/setup.bash`
-- Make sure you sourced the workspace: `source ~/AirSim/ros2/install/setup.bash`
+- Source ROS2 before running: `source /opt/ros/humble/setup.bash`
+- Source the workspace: `source ~/AirSim/ros2/install/setup.bash`
+
+**`build.sh` fails with `clang-8 not found`:**
+- Patch the compiler references: `sed -i 's/clang-8/clang-12/g; s/clang++-8/clang++-12/g' ~/AirSim/build.sh`
+
+**`colcon build` fails with missing tf2/mavros headers:**
+- The CMakeLists.txt patch in Step 3d was not applied or was applied incorrectly
+- Verify the file contains `file(GLOB _ros2_includes /opt/ros/humble/include/*)` before `include_directories`
 
 **Low frame rate despite bridge (< 10 Hz):**
 - Check GPU load on Windows — AirSim render rate drops under high GPU load

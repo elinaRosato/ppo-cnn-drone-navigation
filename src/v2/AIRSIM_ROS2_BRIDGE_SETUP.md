@@ -1,79 +1,168 @@
-# AirSim ROS2 Bridge Setup Guide
+# AirSim ROS2 Bridge Setup — Windows + WSL2
 
-Using the AirSim ROS2 bridge instead of the Python API allows camera images to be
-published as a continuous stream at the simulation's native render rate (20–60 Hz),
-eliminating the TCP round-trip bottleneck of `simGetImages()`. This enables training
-and inference loops that closely match the 30 Hz target of real-world deployment.
+This guide covers the complete setup to run the v2 training script with the
+ROS2 bridge on a **Windows machine running AirSim**, using **WSL2 (Ubuntu)**
+for the ROS2 bridge and the training script.
+
+## Why bother?
+
+The AirSim Python API `simGetImages()` takes ~500 ms per call (TCP round-trip
++ render sync). This limits training to ~1.5 Hz — meaning the 4-frame stack
+spans ~2.7 seconds of real time. On a real drone at 30 Hz, the same 4 frames
+span ~133 ms. The model trained in simulation sees a completely different
+temporal signal than it will encounter on the real drone.
+
+The ROS2 bridge publishes camera frames at the Unreal Engine render rate
+(~20–30 Hz). The training loop reads from a local memory cache (< 1 ms) and
+the bottleneck disappears.
+
+| Method | Step rate | 4-frame span |
+|--------|-----------|--------------|
+| Python API | ~1.5 Hz | ~2.7 s |
+| ROS2 bridge | ~30 Hz | ~133 ms |
+| Real drone (RealSense) | 30 Hz | 133 ms |
 
 ---
 
-## Prerequisites
+## Architecture
 
-| Requirement | Version |
-|-------------|---------|
-| Ubuntu | 20.04 or 22.04 (WSL2 on Windows is possible but adds latency) |
-| ROS2 | Humble (22.04) or Foxy (20.04) |
-| AirSim | Built from source (the ROS2 wrapper is not in pre-built binaries) |
-| Python | 3.8+ |
-| CUDA | Optional but recommended for model inference |
-
-> **Windows note**: AirSim itself runs on Windows, but the ROS2 bridge runs on Linux.
-> The bridge connects to AirSim over the network, so running AirSim on Windows and
-> the bridge on WSL2 or a separate Linux machine is a supported configuration.
-
----
-
-## Step 1: Build AirSim from Source
-
-The ROS2 bridge is located in `AirSim/ros2/` and must be compiled alongside AirSim.
-
-```bash
-git clone https://github.com/microsoft/AirSim.git
-cd AirSim
-./setup.sh       # installs dependencies
-./build.sh       # builds AirSim core libraries
+```
+Windows
+│
+├── AirSim (Unreal Engine)
+│   └── publishes camera + physics at render rate
+│
+└── WSL2 (Ubuntu 22.04)
+    ├── ROS2 Humble
+    │   └── airsim_ros_pkgs  ← connects to AirSim over localhost
+    │       ├── /airsim_node/SimpleFlight/front_center/Scene        (RGB ~30 Hz)
+    │       └── /airsim_node/SimpleFlight/front_center/DepthPerspective (depth ~30 Hz)
+    │
+    └── Python training script (train.py)
+        ├── ROS2CameraBridge  ← subscribes to above topics (background thread)
+        └── AirSim Python API ← reset, arm, takeoff, collision, velocity commands
+            └── connects to AirSim via Windows host IP (172.x.x.x)
 ```
 
 ---
 
-## Step 2: Install ROS2
+## Step 1: Enable WSL2 on Windows
 
-Follow the official ROS2 installation guide for your Ubuntu version:
-- **Ubuntu 22.04**: install ROS2 Humble
-- **Ubuntu 20.04**: install ROS2 Foxy
+Open PowerShell as Administrator and run:
 
-After installation, source the setup file in your `.bashrc`:
+```powershell
+wsl --install
+```
+
+This installs WSL2 with Ubuntu by default. Restart when prompted.
+
+After restart, open the Ubuntu terminal from the Start menu and complete the
+initial user setup (username + password).
+
+Verify WSL2 is the default version:
+
+```powershell
+wsl --set-default-version 2
+wsl -l -v   # should show Ubuntu with VERSION 2
+```
+
+---
+
+## Step 2: Install ROS2 Humble in WSL2
+
+Open the Ubuntu WSL2 terminal and run the official install:
 
 ```bash
+# Set locale
+sudo apt update && sudo apt install -y locales
+sudo locale-gen en_US en_US.UTF-8
+sudo update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+
+# Add ROS2 apt repo
+sudo apt install -y software-properties-common curl
+sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+  -o /usr/share/keyrings/ros-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
+  http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" \
+  | sudo tee /etc/apt/sources.list.d/ros2.list > /dev/null
+
+# Install ROS2 Humble
+sudo apt update
+sudo apt install -y ros-humble-desktop python3-colcon-common-extensions python3-rosdep
+
+# Source ROS2 in every new shell
 echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc
+source ~/.bashrc
+
+# Initialise rosdep
+sudo rosdep init
+rosdep update
+```
+
+---
+
+## Step 3: Build AirSim from Source in WSL2
+
+The ROS2 bridge (`airsim_ros_pkgs`) is only available by building from source.
+
+```bash
+# Dependencies
+sudo apt install -y \
+  build-essential cmake git \
+  ros-humble-cv-bridge ros-humble-image-transport \
+  ros-humble-mavros-msgs ros-humble-geographic-msgs
+
+# Clone AirSim
+cd ~
+git clone https://github.com/microsoft/AirSim.git
+cd AirSim
+
+# Build AirSim core libraries (needed by the ROS2 package)
+./setup.sh
+./build.sh
+```
+
+Then build the ROS2 package:
+
+```bash
+cd ~/AirSim/ros2
+source /opt/ros/humble/setup.bash
+
+rosdep install --from-paths src --ignore-src -r -y
+
+colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+# Source the workspace
+echo "source ~/AirSim/ros2/install/setup.bash" >> ~/.bashrc
 source ~/.bashrc
 ```
 
 ---
 
-## Step 3: Build the AirSim ROS2 Package
+## Step 4: Install Python Dependencies in WSL2
 
 ```bash
-cd AirSim/ros2
-source /opt/ros/humble/setup.bash
+# Python deps for training
+pip install \
+  airsim \
+  gymnasium \
+  stable-baselines3[extra] \
+  opencv-python \
+  numpy \
+  torch torchvision   # or install the CUDA build from pytorch.org
 
-# Install ROS2 dependencies
-rosdep update
-rosdep install --from-paths src --ignore-src -r -y
-
-# Build
-colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
-
-# Source the workspace
-source install/setup.bash
+# cv_bridge Python bindings (already installed via ROS2 apt above,
+# but make sure it's accessible in your Python environment)
+sudo apt install -y python3-cv-bridge
 ```
 
 ---
 
-## Step 4: Configure AirSim Camera
+## Step 5: Configure AirSim on Windows
 
-In your AirSim `settings.json`, configure the camera to publish at the desired resolution
-and frame rate. The ROS2 bridge will pick up this configuration automatically.
+Copy `settings_sample.json` to `C:\Users\<YourName>\Documents\AirSim\settings.json`.
+
+Key settings to verify:
 
 ```json
 {
@@ -86,19 +175,11 @@ and frame rate. The ROS2 bridge will pick up this configuration automatically.
       "Cameras": {
         "front_center": {
           "CaptureSettings": [
-            {
-              "ImageType": 0,
-              "Width": 84,
-              "Height": 84,
-              "FOV_Degrees": 120
-            }
+            { "ImageType": 0, "Width": 256, "Height": 256, "FOV_Degrees": 120 },
+            { "ImageType": 2, "Width": 256, "Height": 256, "FOV_Degrees": 120 }
           ],
-          "X": 0.50,
-          "Y": 0,
-          "Z": -0.25,
-          "Pitch": 0,
-          "Roll": 0,
-          "Yaw": 0
+          "X": 0.50, "Y": 0, "Z": -0.25,
+          "Pitch": 0, "Roll": 0, "Yaw": 0
         }
       }
     }
@@ -106,181 +187,159 @@ and frame rate. The ROS2 bridge will pick up this configuration automatically.
 }
 ```
 
+> **ClockSpeed must be 1.0 when using the ROS2 bridge.** Setting it higher
+> speeds up physics but the ROS2 image topics still publish at the real-time
+> render rate, creating desynchronisation between the physics and the images
+> the model sees.
+
+Both `ImageType 0` (Scene/RGB) and `ImageType 2` (DepthPerspective) must be
+listed so the AirSim ROS2 bridge publishes both topics.
+
 ---
 
-## Step 5: Launch the ROS2 Bridge
+## Step 6: Find the Windows Host IP (from WSL2)
 
-Start AirSim (Unreal Engine), then in a Linux terminal:
+WSL2 runs in a virtual network. To connect from WSL2 to AirSim running on
+Windows, you need the Windows host IP as seen from inside WSL2.
 
 ```bash
-source AirSim/ros2/install/setup.bash
+# Run this inside WSL2
+export AIRSIM_HOST=$(cat /etc/resolv.conf | grep nameserver | awk '{print $2}')
+echo $AIRSIM_HOST   # typically 172.x.x.x
+```
+
+Add it to your `~/.bashrc` so you don't have to set it every session:
+
+```bash
+echo 'export AIRSIM_HOST=$(cat /etc/resolv.conf | grep nameserver | awk '"'"'{print $2}'"'"')' >> ~/.bashrc
+source ~/.bashrc
+```
+
+> **Windows Firewall:** AirSim listens on port 41451. If the connection is
+> refused, add an inbound firewall rule in Windows:
+> Settings → Windows Defender Firewall → Advanced Settings →
+> Inbound Rules → New Rule → Port 41451 → Allow.
+
+---
+
+## Step 7: Launch AirSim on Windows
+
+Start your Unreal Engine project (or a pre-built AirSim binary) on the Windows
+side as normal. Wait for the simulation to fully load before proceeding.
+
+---
+
+## Step 8: Launch the ROS2 Bridge in WSL2
+
+In a WSL2 terminal:
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/AirSim/ros2/install/setup.bash
+
 ros2 launch airsim_ros_pkgs airsim_node.launch.py \
   output:=screen \
-  host:=<AIRSIM_HOST_IP>   # use 127.0.0.1 if on the same machine / WSL2
+  host:=$AIRSIM_HOST
 ```
 
-The bridge will begin publishing topics including:
+You should see log lines like:
+```
+[airsim_node]: Connected to AirSim!
+[airsim_node]: Publishing image on /airsim_node/SimpleFlight/front_center/Scene
+```
 
-| Topic | Type | Description |
-|-------|------|-------------|
-| `/airsim_node/SimpleFlight/front_center/Scene` | `sensor_msgs/Image` | RGB camera stream |
-| `/airsim_node/SimpleFlight/front_center/DepthPerspective` | `sensor_msgs/Image` | Depth stream |
-| `/airsim_node/SimpleFlight/odom_local_ned` | `nav_msgs/Odometry` | Drone position/velocity |
-
-Verify topics are publishing:
+Verify both topics are publishing at the expected rate:
 
 ```bash
+# In a second WSL2 terminal
 ros2 topic hz /airsim_node/SimpleFlight/front_center/Scene
-# Should show ~20-60 Hz depending on hardware
+# Expected: ~20-30 Hz
+
+ros2 topic hz /airsim_node/SimpleFlight/front_center/DepthPerspective
+# Expected: ~20-30 Hz
 ```
 
 ---
 
-## Step 6: Rewrite the Training Loop as ROS2 Nodes
+## Step 9: Run Training in WSL2
 
-The training environment must change from a blocking request-response model to an
-event-driven subscriber model.
+Open a third WSL2 terminal, navigate to the `src/v2` directory, and run:
 
-### Architecture
+```bash
+cd /path/to/ppo-cnn-drone-navigation/src/v2
 
-```
-AirSim → ROS2 Image Topic (30 Hz)
-              ↓
-        Image Subscriber Node
-              ↓ latest frame (cached)
-        RL Step Loop (runs at subscriber rate)
-              ↓ action
-        Velocity Command Publisher
-              ↓
-        /airsim_node/vel_cmd_body_frame topic
-              ↓
-        AirSim drone
-```
+# Make sure AIRSIM_HOST is set (if not already in .bashrc)
+export AIRSIM_HOST=$(cat /etc/resolv.conf | grep nameserver | awk '{print $2}')
 
-### Key ROS2 Topics to Publish/Subscribe
+# Start training with the ROS2 bridge
+python train.py --ros2
 
-**Subscribe (inputs to the model):**
-```python
-# Latest RGB frame
-self.create_subscription(Image, '/airsim_node/SimpleFlight/front_center/Scene',
-                         self.image_callback, 10)
+# Optional: specify total steps
+python train.py --ros2 --steps 500000
 
-# Drone odometry (position for goal check)
-self.create_subscription(Odometry, '/airsim_node/SimpleFlight/odom_local_ned',
-                         self.odom_callback, 10)
+# Resume a previous run with the bridge
+python train.py --ros2 --resume
 ```
 
-**Publish (model output):**
-```python
-# Body-frame velocity command
-self.vel_pub = self.create_publisher(
-    VelCmd, '/airsim_node/SimpleFlight/vel_cmd_body_frame', 10)
-```
-
-### Minimal Node Structure
-
-```python
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import Image
-from nav_msgs.msg import Odometry
-from airsim_interfaces.msg import VelCmd
-import cv2
-import numpy as np
-from cv_bridge import CvBridge
-from stable_baselines3 import PPO
-
-class AvoidanceNode(Node):
-    def __init__(self):
-        super().__init__('avoidance_node')
-        self.bridge = CvBridge()
-        self.model = PPO.load('path/to/model.zip')
-        self.latest_frame = None
-        self.frame_stack = np.zeros((4, 84, 84), dtype=np.uint8)
-        self.position = None
-
-        self.create_subscription(Image,
-            '/airsim_node/SimpleFlight/front_center/Scene',
-            self.image_callback, 10)
-        self.create_subscription(Odometry,
-            '/airsim_node/SimpleFlight/odom_local_ned',
-            self.odom_callback, 10)
-        self.vel_pub = self.create_publisher(VelCmd,
-            '/airsim_node/SimpleFlight/vel_cmd_body_frame', 10)
-
-        # Run inference at 30 Hz
-        self.create_timer(1.0 / 30.0, self.inference_step)
-
-    def image_callback(self, msg):
-        cv_img = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
-        gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.resize(gray, (84, 84))
-        # Update frame stack
-        self.frame_stack = np.roll(self.frame_stack, shift=-1, axis=0)
-        self.frame_stack[-1] = gray
-
-    def odom_callback(self, msg):
-        self.position = msg.pose.pose.position
-
-    def inference_step(self):
-        if self.latest_frame is None or self.position is None:
-            return
-        action, _ = self.model.predict(self.frame_stack, deterministic=True)
-        cmd = VelCmd()
-        cmd.vx = 3.0 + float(action[0])  # base_speed + lateral correction
-        cmd.vy = 0.0
-        cmd.vz = float(action[1]) * 0.5  # vertical correction
-        self.vel_pub.publish(cmd)
-
-def main():
-    rclpy.init()
-    node = AvoidanceNode()
-    rclpy.spin(node)
-
-if __name__ == '__main__':
-    main()
-```
+The script will:
+1. Start `ROS2CameraBridge` in a background thread
+2. Wait up to 10 seconds for the first frame to arrive
+3. Print the confirmed AirSim connection host
+4. Show the per-step timing breakdown every 25 steps so you can verify the
+   bridge is working (`images=` should be < 5 ms, not ~600 ms)
 
 ---
 
-## Step 7: Training with the ROS2 Bridge
+## Verifying It Works
 
-For RL training, the environment class must be adapted to use the ROS2 subscriber
-pattern. The main differences from the Python API version:
+Look for these signs in the training output:
 
-1. **Image capture is non-blocking** — the latest frame is always available from the
-   last callback. The step loop runs at the timer rate, not the capture rate.
-2. **Reward and collision info** still come from the AirSim Python API (or ROS2
-   service calls) — the bridge does not expose collision events as topics by default.
-3. **Reset** still requires the AirSim Python API (`client.reset()`).
+**Bridge connected:**
+```
+[ROS2Bridge] Subscriber thread started → .../Scene + .../DepthPerspective
+ROS2 bridge ready.
+Connected to AirSim at 172.x.x.x!
+```
 
-A hybrid approach is common: use the ROS2 bridge for high-frequency image streaming,
-and the Python API only for environment management (reset, collision check, takeoff).
+**Step timing with bridge active (images < 5 ms):**
+```
+[TIMING ms] pos1=4.1 move=1.0 images=0.3 collision=3.9 pos2=4.2 total=13.5 (~74.1 Hz)
+[IMG-ROS2 ms] rgb_cache=0.1 depth_ros2=0.1
+```
+
+**Step timing without bridge (images ~600 ms):**
+```
+[TIMING ms] pos1=4.2 move=1.1 images=612.3 collision=3.8 pos2=4.0 total=625.4 (~1.6 Hz)
+[IMG-API ms] simGetImages=609.7
+```
+
+If `depth_ros2` shows as `depth_api` in the output, the depth topic hasn't
+received its first frame yet — this is normal for the first few steps and
+resolves automatically.
 
 ---
 
-## Expected Improvement
+## Troubleshooting
 
-| Method | Effective Hz | Scene change at 3 m/s |
-|--------|-------------|----------------------|
-| Python API, 256×256 | <1 Hz | >300 cm |
-| Python API, 84×84 | ~5 Hz | ~60 cm |
-| ROS2 bridge, 84×84 | ~20–30 Hz | ~10–15 cm |
-| Real deployment (RealSense) | 30 Hz | 10 cm |
+**`Connection refused` on AirSim Python API:**
+- Check `AIRSIM_HOST` is set correctly and that AirSim is running
+- Add a Windows Firewall inbound rule for TCP port 41451
 
-With the ROS2 bridge at 84×84, the simulation closely matches real deployment conditions
-without requiring speed domain randomization as a compensatory technique.
+**ROS2 bridge receives no frames:**
+- Confirm the `airsim_node` launched without errors
+- Confirm `host:=$AIRSIM_HOST` in the launch command matches the Windows IP
+- Run `ros2 topic list` — if the topics don't appear, the bridge isn't connected to AirSim
 
----
+**`ImportError: No module named 'rclpy'`:**
+- Make sure you sourced ROS2 before running: `source /opt/ros/humble/setup.bash`
+- Make sure you sourced the workspace: `source ~/AirSim/ros2/install/setup.bash`
 
-## Complexity vs. Benefit Summary
+**Low frame rate despite bridge (< 10 Hz):**
+- Check GPU load on Windows — AirSim render rate drops under high GPU load
+- Lower `Width`/`Height` in `settings.json` (the bridge renders at native
+  resolution; downsampling to 84×84 happens in Python)
 
-| Approach | Setup complexity | Sim Hz | Sim-to-real gap |
-|----------|-----------------|--------|-----------------|
-| Python API + speed randomization | Low | ~5 Hz | Moderate |
-| Python API, 84×84 RGB-only | Low | ~8 Hz | Moderate |
-| ROS2 bridge | High | ~20–30 Hz | Small |
-
-The ROS2 bridge is the right long-term architecture if the real drone also runs ROS2
-(e.g., Jetson + MAVROS + RealSense driver), as the simulation and real software stacks
-become nearly identical.
+**`ClockSpeed` > 1.0 + ROS2 bridge = wrong observations:**
+- Keep `ClockSpeed: 1.0` when using the bridge. The bridge publishes images
+  at wall-clock render rate regardless of simulation speed, so a faster
+  clock means physics advance faster than images update.

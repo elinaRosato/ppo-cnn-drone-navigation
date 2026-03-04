@@ -6,10 +6,16 @@ based on camera input to avoid obstacles.
 Navigation is handled by a simple controller.
 
 Usage:
-    python train.py                     # New training, 200k steps
-    python train.py --steps 500000      # New training, 500k steps
-    python train.py --resume            # Resume from latest checkpoint
+    python train.py                          # New training, 200k steps
+    python train.py --steps 500000           # New training, 500k steps
+    python train.py --resume                 # Resume from latest checkpoint
     python train.py --resume --steps 400000  # Resume, train to 400k total
+    python train.py --ros2                   # Use ROS2 bridge for images (~30 Hz)
+
+Environment variables:
+    AIRSIM_HOST   IP of the machine running AirSim (default: localhost).
+                  Set this when training from WSL2:
+                    export AIRSIM_HOST=$(cat /etc/resolv.conf | grep nameserver | awk '{print $2}')
 """
 
 import os
@@ -24,9 +30,9 @@ import torch
 from avoidance_env import ObstacleAvoidanceEnv
 
 
-def make_env():
+def make_env(ros2_bridge=None):
     def _init():
-        env = ObstacleAvoidanceEnv()
+        env = ObstacleAvoidanceEnv(ros2_bridge=ros2_bridge)
         return Monitor(env)
     return _init
 
@@ -46,7 +52,7 @@ def get_latest_run_dir(base_dir):
     return os.path.join(base_dir, run_dirs[-1])
 
 
-def train(resume=False, target_steps=None):
+def train(resume=False, target_steps=None, use_ros2=False):
     base_model_dir = "./models_v2"
     base_log_dir = "./logs_v2"
     os.makedirs(base_model_dir, exist_ok=True)
@@ -58,13 +64,35 @@ def train(resume=False, target_steps=None):
     print("\nModel input:  4x grayscale RGB frames (4, 84, 84)")
     print("Model output: Lateral + vertical correction")
     print("Controller:   Flies toward goal automatically")
+    image_src = "ROS2 bridge (~30 Hz)" if use_ros2 else "AirSim Python API (~1-5 Hz)"
+    print(f"Image source: {image_src}")
     print("=" * 70)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"\nDevice: {device}")
 
+    ros2_bridge = None
+    if use_ros2:
+        from ros2_bridge import ROS2CameraBridge
+        ros2_bridge = ROS2CameraBridge()
+        ros2_bridge.start()
+        print("\nROS2 bridge started — waiting for first frames...")
+        import time
+        # Give the subscriber a moment to receive at least one frame before
+        # the environment's reset() tries to capture an image
+        timeout = 10.0
+        t0 = time.time()
+        while not ros2_bridge.has_frame:
+            if time.time() - t0 > timeout:
+                print("WARNING: ROS2 bridge received no frames after "
+                      f"{timeout:.0f}s. Is the AirSim ROS2 node running?")
+                break
+            time.sleep(0.1)
+        if ros2_bridge.has_frame:
+            print("ROS2 bridge ready.")
+
     print("\nCreating environment...")
-    env = DummyVecEnv([make_env()])
+    env = DummyVecEnv([make_env(ros2_bridge=ros2_bridge)])
 
     run_dir = None
     log_dir = None
@@ -157,6 +185,8 @@ def train(resume=False, target_steps=None):
 
     print("CHECKLIST:")
     print("  [ ] AirSim is running with your environment")
+    if use_ros2:
+        print("  [ ] ROS2 bridge is running (ros2 launch airsim_ros_pkgs airsim_node.launch.py ...)")
     print("  [ ] GPU/CUDA available (recommended)")
     print("")
 
@@ -183,6 +213,8 @@ def train(resume=False, target_steps=None):
 
     finally:
         env.close()
+        if ros2_bridge is not None:
+            ros2_bridge.stop()
 
 
 if __name__ == "__main__":
@@ -191,6 +223,9 @@ if __name__ == "__main__":
                         help='Resume from latest checkpoint')
     parser.add_argument('--steps', type=int, default=None,
                         help='Target total timesteps (default: 200000)')
+    parser.add_argument('--ros2', action='store_true',
+                        help='Use ROS2 bridge for high-frequency image capture (~30 Hz). '
+                             'Requires the AirSim ROS2 node to be running and AIRSIM_HOST set.')
     args = parser.parse_args()
 
-    train(resume=args.resume, target_steps=args.steps)
+    train(resume=args.resume, target_steps=args.steps, use_ros2=args.ros2)

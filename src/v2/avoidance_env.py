@@ -4,7 +4,7 @@ Simplified Obstacle Avoidance Environment
 Navigation is handled by a simple controller (go toward goal).
 The RL model ONLY learns obstacle avoidance from the camera image.
 
-Controller: flies forward toward goal at base_speed
+Controller: flies forward toward goal at episode_speed (randomised each reset)
 RL Model:   sees 4 stacked grayscale frames, outputs lateral + vertical correction
 Combined:   velocity = forward_toward_goal + lateral_perpendicular + altitude_hold
 Yaw:        faces actual movement direction (camera sees what's ahead)
@@ -13,9 +13,15 @@ Observation: (4, 84, 84) uint8 — 4 stacked grayscale frames, channels-first (C
              No VecTransposeImage needed; SB3 CnnPolicy detects CHW automatically.
 Depth image: requested alongside RGB in the same API call, used only for the
              soft proximity penalty reward (not fed to the model).
+
+ROS2 bridge: if a ROS2CameraBridge instance is passed as ros2_bridge, RGB frames
+             are consumed from the subscriber at ~30 Hz instead of via simGetImages.
+             Depth is still fetched from the AirSim Python API (one call per step).
 """
 
 import math
+import os
+import time
 import gymnasium as gym
 from gymnasium import spaces
 import airsim
@@ -31,38 +37,44 @@ class ObstacleAvoidanceEnv(gym.Env):
     def __init__(self,
                  goal_distance_range=(50, 50),
                  cruising_altitude=-5.0,
-                 base_speed=5.0,
+                 speed_range=(1.0, 3.0),
                  lateral_scale=1.0,
                  vertical_scale=0.5,
                  goal_radius=5.0,
                  max_steps=500,
-                 show_visual_marker=False):
+                 show_visual_marker=False,
+                 ros2_bridge=None):
         super().__init__()
 
         self.goal_distance_range = goal_distance_range
         self.cruising_altitude = cruising_altitude
-        self.base_speed = base_speed
+        self.speed_range = speed_range
         self.lateral_scale = lateral_scale
         self.vertical_scale = vertical_scale
         self.goal_radius = goal_radius
         self.max_steps = max_steps
         self.show_visual_marker = show_visual_marker
+        self.ros2_bridge = ros2_bridge
 
         self.img_height = 84
         self.img_width = 84
         self.stack_frames = 4
 
-        # Soft proximity penalty: penalise if anything in the centre of the
-        # depth image is closer than this threshold (metres).
+        # Soft proximity penalty threshold (metres)
         self.prox_threshold = 5.0
 
-        # Connect to AirSim
-        self.client = airsim.MultirotorClient()
+        # Connect to AirSim.
+        # When running from WSL2, set AIRSIM_HOST to the Windows host IP
+        # (e.g. export AIRSIM_HOST=172.x.x.x).  Defaults to localhost.
+        airsim_host = os.environ.get('AIRSIM_HOST', '')
+        self.client = airsim.MultirotorClient(ip=airsim_host) if airsim_host else airsim.MultirotorClient()
         self.client.confirmConnection()
-        print("Connected to AirSim!")
+        host_str = airsim_host if airsim_host else 'localhost'
+        print(f"Connected to AirSim at {host_str}!")
 
         self.camera_name = "front_center"
         self.goal_pos = None
+        self.episode_speed = float(np.mean(speed_range))  # placeholder until first reset
 
         # Observation: 4 stacked grayscale frames in CHW format.
         # SB3 CnnPolicy expects (C, H, W); first dim (4) < spatial dims (84)
@@ -93,6 +105,9 @@ class ObstacleAvoidanceEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
+        # Randomise forward speed for this episode
+        self.episode_speed = float(np.random.uniform(*self.speed_range))
+
         # Random goal position
         angle = np.random.uniform(0, 2 * np.pi)
         dist = np.random.uniform(*self.goal_distance_range)
@@ -101,7 +116,8 @@ class ObstacleAvoidanceEnv(gym.Env):
         goal_z = self.cruising_altitude
         self.goal_pos = np.array([goal_x, goal_y, goal_z], dtype=np.float32)
 
-        print(f"\nGoal: ({goal_x:.1f}, {goal_y:.1f}, {goal_z:.1f})")
+        print(f"\nGoal: ({goal_x:.1f}, {goal_y:.1f}, {goal_z:.1f}) | "
+              f"Speed: {self.episode_speed:.1f} m/s")
 
         try:
             with open("goal_position.txt", "w") as f:
@@ -109,12 +125,20 @@ class ObstacleAvoidanceEnv(gym.Env):
         except Exception:
             pass
 
-        # Reset drone and take off
+        # Reset drone, arm, take off, climb to cruising altitude
         self.client.reset()
         self.client.enableApiControl(True)
         self.client.armDisarm(True)
         self.client.takeoffAsync().join()
         self.client.moveToZAsync(self.cruising_altitude, 2.0).join()
+
+        # Rotate to face the goal before capturing the first frame.
+        # Without this, the frame stack is initialised with whatever direction
+        # AirSim resets to (typically X+), so the first episode steps see a
+        # camera view that doesn't match the actual direction of travel.
+        goal_yaw = math.degrees(math.atan2(goal_y, goal_x))
+        self.client.rotateToYawAsync(goal_yaw, timeout_sec=5.0).join()
+        time.sleep(0.2)  # let angular velocity settle after rotation
 
         if self.show_visual_marker:
             self.client.simFlushPersistentMarkers()
@@ -131,7 +155,8 @@ class ObstacleAvoidanceEnv(gym.Env):
         self.collision_count = 0
         self.prev_action = np.zeros(2, dtype=np.float32)
 
-        # Fill the frame stack with the first captured frame (no motion yet)
+        # Fill the frame stack with the first captured frame (no motion yet,
+        # but already facing the goal after rotateToYaw above)
         initial_gray, _ = self._get_images()
         for i in range(self.stack_frames):
             self.frame_stack[i] = initial_gray
@@ -139,6 +164,7 @@ class ObstacleAvoidanceEnv(gym.Env):
         return self.frame_stack.copy(), {}
 
     def step(self, action):
+        t_step_start = time.perf_counter()
         self.current_step += 1
 
         # Action smoothing: 50% blend with previous action.
@@ -146,7 +172,9 @@ class ObstacleAvoidanceEnv(gym.Env):
         action = 0.5 * np.array(action, dtype=np.float32) + 0.5 * self.prev_action
         self.prev_action = action.copy()
 
+        t0 = time.perf_counter()
         position = self._get_position()
+        t_get_pos1 = time.perf_counter() - t0
 
         # Controller: unit vector toward goal and perpendicular (left)
         dx = self.goal_pos[0] - position[0]
@@ -160,8 +188,8 @@ class ObstacleAvoidanceEnv(gym.Env):
         vertical = float(action[1]) * self.vertical_scale
 
         # Combined velocity: forward toward goal + lateral perpendicular
-        vel_x = self.base_speed * ux + lateral * px
-        vel_y = self.base_speed * uy + lateral * py
+        vel_x = self.episode_speed * ux + lateral * px
+        vel_y = self.episode_speed * uy + lateral * py
         speed_xy = math.sqrt(vel_x * vel_x + vel_y * vel_y)
 
         # Yaw faces actual movement direction so camera sees what's ahead
@@ -179,29 +207,49 @@ class ObstacleAvoidanceEnv(gym.Env):
         if position[2] > self.cruising_altitude + 1.0:
             body_vz = min(body_vz, base_vz)
 
-        if self.current_step % 25 == 1:
-            print(f"  Step {self.current_step}: dist={dist_xy:.1f}m "
-                  f"vel=({vel_x:.2f},{vel_y:.2f}) body_vx={body_vx:.2f} "
-                  f"action=({action[0]:.2f},{action[1]:.2f})")
-
+        t0 = time.perf_counter()
         self.client.moveByVelocityBodyFrameAsync(
             float(body_vx), float(body_vy), float(body_vz), 5.0,
             yaw_mode=yaw_mode
         )
+        t_move_cmd = time.perf_counter() - t0
 
         # Single API call returns both RGB (for obs) and depth (for penalty)
+        t0 = time.perf_counter()
         gray, depth = self._get_images()
+        t_images = time.perf_counter() - t0
+
         self._update_frame_stack(gray)
 
         # Check collision
+        t0 = time.perf_counter()
         collision = self.client.simGetCollisionInfo().has_collided
+        t_collision = time.perf_counter() - t0
+
         if collision:
             self.collision_count += 1
 
         # Check goal
+        t0 = time.perf_counter()
         new_position = self._get_position()
+        t_get_pos2 = time.perf_counter() - t0
+
         new_distance = np.linalg.norm(new_position[:2] - self.goal_pos[:2])
         goal_reached = new_distance < self.goal_radius
+
+        t_step_total = time.perf_counter() - t_step_start
+
+        if self.current_step % 25 == 1:
+            print(f"  Step {self.current_step}: dist={dist_xy:.1f}m "
+                  f"speed={self.episode_speed:.1f}m/s "
+                  f"action=({action[0]:.2f},{action[1]:.2f})")
+            print(f"  [TIMING ms] pos1={t_get_pos1*1000:.1f} "
+                  f"move={t_move_cmd*1000:.1f} "
+                  f"images={t_images*1000:.1f} "
+                  f"collision={t_collision*1000:.1f} "
+                  f"pos2={t_get_pos2*1000:.1f} "
+                  f"total={t_step_total*1000:.1f} "
+                  f"(~{1/t_step_total:.1f} Hz)")
 
         if goal_reached:
             print(f"  Goal reached! Steps: {self.current_step}")
@@ -215,13 +263,15 @@ class ObstacleAvoidanceEnv(gym.Env):
         if collision:
             reward -= 10.0
 
-        # Soft proximity penalty: centre 50% of depth image, threshold self.prox_threshold.
-        # Gives a smooth gradient pushing the drone to stay clear of obstacles,
-        # rather than only penalising at the hard collision boundary.
+        # Soft proximity penalty: centre 50% of depth image.
+        # Clamp to [0, prox_threshold] first — anything beyond the threshold
+        # is background we don't care about, and this also guards against
+        # NaN/inf that AirSim can return for open sky.
         center_depth = depth[
             self.img_height // 4: 3 * self.img_height // 4,
             self.img_width  // 4: 3 * self.img_width  // 4
         ]
+        center_depth = np.clip(center_depth, 0.0, self.prox_threshold)
         min_depth_center = float(np.min(center_depth))
         if min_depth_center < self.prox_threshold:
             reward -= (self.prox_threshold - min_depth_center) / self.prox_threshold * 2.0
@@ -249,15 +299,60 @@ class ObstacleAvoidanceEnv(gym.Env):
         }
 
     def _get_images(self):
-        """Single API call: RGB scene → grayscale (observation) + raw depth (penalty).
+        """Get grayscale frame (observation) and depth (penalty).
 
-        Depth is returned in raw metres and is NOT normalised — it is used only
-        for computing the proximity reward, never fed to the model.
+        When ros2_bridge is set: both RGB and depth come from ROS2 topic
+        caches (~30 Hz, no blocking API calls). Depth falls back to the
+        AirSim Python API only if the bridge has not yet received a depth
+        frame (e.g. depth_topic=None or bridge just started).
+
+        Without bridge: both fetched in a single simGetImages call.
         """
+        if self.ros2_bridge is not None:
+            # RGB — reads from the cached frame (no network call)
+            t0 = time.perf_counter()
+            gray = self.ros2_bridge.get_latest_frame()
+            t_rgb = time.perf_counter() - t0
+            if gray is None:
+                print("    [ROS2] WARNING: no RGB frame yet, using blank")
+                gray = np.zeros((self.img_height, self.img_width), dtype=np.uint8)
+
+            # Depth — prefer ROS2 cache; fall back to AirSim API if not available
+            t0 = time.perf_counter()
+            depth = self.ros2_bridge.get_latest_depth()
+            t_depth_ros2 = time.perf_counter() - t0
+            t_depth_api = 0.0
+
+            if depth is None:
+                # Bridge has no depth yet (or depth_topic=None) — use API
+                t0 = time.perf_counter()
+                depth_resp = self.client.simGetImages([
+                    airsim.ImageRequest(self.camera_name, airsim.ImageType.DepthPerspective, True, False),
+                ])
+                t_depth_api = time.perf_counter() - t0
+
+                if depth_resp and depth_resp[0].width > 0:
+                    r = depth_resp[0]
+                    depth = airsim.list_to_2d_float_array(r.image_data_float, r.width, r.height)
+                    depth = cv2.resize(depth, (self.img_width, self.img_height))
+                else:
+                    depth = np.full((self.img_height, self.img_width), 100.0, dtype=np.float32)
+
+            if self.current_step % 25 == 1:
+                src = "api" if t_depth_api > 0 else "ros2"
+                t_depth = t_depth_api if t_depth_api > 0 else t_depth_ros2
+                print(f"    [IMG-ROS2 ms] rgb_cache={t_rgb*1000:.1f} "
+                      f"depth_{src}={t_depth*1000:.1f}")
+
+            return gray, depth
+
+        # No bridge: single API call for both
+        t0 = time.perf_counter()
         responses = self.client.simGetImages([
             airsim.ImageRequest(self.camera_name, airsim.ImageType.Scene, False, False),
             airsim.ImageRequest(self.camera_name, airsim.ImageType.DepthPerspective, True, False),
         ])
+        t_api = time.perf_counter() - t0
 
         # --- RGB → grayscale ---
         if responses and responses[0].width > 0:
@@ -282,8 +377,10 @@ class ObstacleAvoidanceEnv(gym.Env):
             depth = airsim.list_to_2d_float_array(r.image_data_float, r.width, r.height)
             depth = cv2.resize(depth, (self.img_width, self.img_height))
         else:
-            # Fallback: treat everything as far away so no penalty is applied
             depth = np.full((self.img_height, self.img_width), 100.0, dtype=np.float32)
+
+        if self.current_step % 25 == 1:
+            print(f"    [IMG-API ms] simGetImages={t_api*1000:.1f}")
 
         return gray, depth
 

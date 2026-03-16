@@ -24,7 +24,7 @@ import os
 import time
 import gymnasium as gym
 from gymnasium import spaces
-import airsim
+import cosysairsim as airsim
 import numpy as np
 import cv2
 
@@ -36,10 +36,10 @@ class ObstacleAvoidanceEnv(gym.Env):
 
     def __init__(self,
                  goal_distance_range=(50, 50),
-                 cruising_altitude=-5.0,
+                 cruising_altitude=-1.5,
                  speed_range=(1.0, 3.0),
                  lateral_scale=1.0,
-                 vertical_scale=0.5,
+                 vertical_scale=1.0,
                  goal_radius=5.0,
                  max_steps=2000,
                  step_hz=30.0,
@@ -204,7 +204,7 @@ class ObstacleAvoidanceEnv(gym.Env):
 
         # Altitude hold
         altitude_error = self.cruising_altitude - position[2]
-        base_vz = float(np.clip(altitude_error * 0.5, -1.0, 1.0))
+        base_vz = float(np.clip(altitude_error * 0.2, -1.0, 1.0))
         body_vz = base_vz + vertical
         if position[2] > self.cruising_altitude + 1.0:
             body_vz = min(body_vz, base_vz)

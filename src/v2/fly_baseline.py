@@ -12,7 +12,7 @@ Usage:
 import math
 import time
 import argparse
-import airsim
+import cosysairsim as airsim
 import numpy as np
 
 

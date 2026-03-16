@@ -13,7 +13,7 @@ import os
 import math
 import time
 import argparse
-import airsim
+import cosysairsim as airsim
 import numpy as np
 import cv2
 from stable_baselines3 import PPO

@@ -23,9 +23,94 @@ import argparse
 from datetime import datetime
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from stable_baselines3.common.monitor import Monitor
 import torch
+
+
+class ValidationCallback(BaseCallback):
+    """Runs deterministic validation episodes every N training episodes.
+
+    Uses model.predict(deterministic=True) so results reflect the true
+    policy quality, not the stochastic exploration used during training.
+    Logs to validation/success_rate in TensorBoard.
+    """
+
+    def __init__(self, val_episodes=10, val_every_n_episodes=100, verbose=0):
+        super().__init__(verbose)
+        self.val_episodes = val_episodes
+        self.val_every_n_episodes = val_every_n_episodes
+        self.episode_count = 0
+        self.last_val_episode = 0
+
+    def _on_step(self) -> bool:
+        for done in self.locals.get('dones', []):
+            if done:
+                self.episode_count += 1
+        return True
+
+    def _on_rollout_end(self) -> None:
+        if self.episode_count - self.last_val_episode < self.val_every_n_episodes:
+            return
+        self.last_val_episode = self.episode_count
+
+        print(f"\n[Validation] Running {self.val_episodes} deterministic episodes "
+              f"(after {self.episode_count} training episodes)...")
+
+        env = self.training_env
+        successes = 0
+
+        for _ in range(self.val_episodes):
+            obs = env.reset()
+            done = False
+            info = {}
+            while not done:
+                action, _ = self.model.predict(obs, deterministic=True)
+                obs, _, dones, infos = env.step(action)
+                done = bool(dones[0])
+                info = infos[0]
+            if info.get('goal_reached', False):
+                successes += 1
+
+        val_success_rate = successes / self.val_episodes
+        self.logger.record('validation/success_rate', val_success_rate)
+        self.logger.record('validation/episodes_trained', self.episode_count)
+        self.logger.dump(self.num_timesteps)
+
+        print(f"[Validation] Success rate: {val_success_rate:.0%} "
+              f"({successes}/{self.val_episodes})\n")
+
+        env.reset()
+
+
+class SuccessRateCallback(BaseCallback):
+    """Logs episode success rate to TensorBoard.
+
+    Tracks outcomes over a rolling window of `window` episodes so the metric
+    reflects recent performance rather than the cumulative average.
+    Logs every `window` completed episodes.
+    """
+
+    def __init__(self, window=50, verbose=0):
+        super().__init__(verbose)
+        self.window = window
+        self.episode_count = 0
+        self.outcomes = []  # rolling window: 1 = success, 0 = failure
+
+    def _on_step(self) -> bool:
+        dones = self.locals.get('dones', [])
+        infos = self.locals.get('infos', [])
+        for done, info in zip(dones, infos):
+            if done:
+                self.episode_count += 1
+                self.outcomes.append(1 if info.get('goal_reached', False) else 0)
+                if len(self.outcomes) > self.window:
+                    self.outcomes.pop(0)
+                if self.episode_count % self.window == 0:
+                    success_rate = sum(self.outcomes) / len(self.outcomes)
+                    self.logger.record('rollout/success_rate', success_rate)
+                    self.logger.record('rollout/episodes', self.episode_count)
+        return True
 
 from avoidance_env import ObstacleAvoidanceEnv
 
@@ -33,7 +118,7 @@ from avoidance_env import ObstacleAvoidanceEnv
 def make_env(ros2_bridge=None):
     def _init():
         env = ObstacleAvoidanceEnv(ros2_bridge=ros2_bridge)
-        return Monitor(env)
+        return Monitor(env, info_keywords=('goal_reached',))
     return _init
 
 
@@ -160,10 +245,12 @@ def train(resume=False, target_steps=None, use_ros2=False):
         )
 
     checkpoint_callback = CheckpointCallback(
-        save_freq=20000,
+        save_freq=30000,
         save_path=os.path.join(run_dir, "checkpoints"),
         name_prefix="simplified_avoidance"
     )
+    success_callback = SuccessRateCallback(window=50)
+    validation_callback = ValidationCallback(val_episodes=10, val_every_n_episodes=100)
 
     total_timesteps = target_steps if target_steps else 200_000
     current_steps = model.num_timesteps if hasattr(model, 'num_timesteps') else 0
@@ -195,7 +282,7 @@ def train(resume=False, target_steps=None, use_ros2=False):
     try:
         model.learn(
             total_timesteps=remaining_timesteps,
-            callback=checkpoint_callback,
+            callback=[checkpoint_callback, success_callback, validation_callback],
             progress_bar=True,
             reset_num_timesteps=False,
             tb_log_name="avoidance"

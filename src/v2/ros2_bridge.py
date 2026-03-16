@@ -29,8 +29,8 @@ The AirSim ROS2 bridge must be running before bridge.start() is called:
     ros2 launch airsim_ros_pkgs airsim_node.launch.py host:=<AIRSIM_IP>
 
 Topics published by the bridge (default vehicle SimpleFlight):
-    /airsim_node/SimpleFlight/front_center/Scene            (sensor_msgs/Image)
-    /airsim_node/SimpleFlight/front_center/DepthPerspective (sensor_msgs/Image)
+    /airsim_node/SimpleFlight/front_center_Scene/image            (sensor_msgs/Image)
+    /airsim_node/SimpleFlight/front_center_DepthPerspective/image (sensor_msgs/Image)
 """
 
 import threading
@@ -52,8 +52,8 @@ class ROS2CameraBridge:
 
     def __init__(
         self,
-        image_topic: str = '/airsim_node/SimpleFlight/front_center/Scene',
-        depth_topic: str = '/airsim_node/SimpleFlight/front_center/DepthPerspective',
+        image_topic: str = '/airsim_node/SimpleFlight/front_center_Scene/image',
+        depth_topic: str = '/airsim_node/SimpleFlight/front_center_DepthPerspective/image',
         target_size: tuple = (84, 84),
     ):
         """

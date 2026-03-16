@@ -10,7 +10,7 @@ Press Ctrl+C to stop.
 
 import time
 import math
-import airsim
+import cosysairsim as airsim
 
 
 def sphere_points(cx, cy, cz, radius, n_points=80):

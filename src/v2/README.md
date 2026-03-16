@@ -241,32 +241,78 @@ The model adds corrections perpendicular to the goal direction.
 
 ## Quick Start
 
+Activate the venv from the project root before running any script:
+
+```bash
+source ~/Sites/ppo-cnn-drone-navigation/venv/bin/activate
+cd ~/Sites/ppo-cnn-drone-navigation
+```
+
 ```bash
 # Train (new run, 200k steps)
-python train.py
+python3 src/v2/train.py
 
 # Resume from latest checkpoint
-python train.py --resume
+python3 src/v2/train.py --resume
 
 # Test a trained model
-python test.py --model models_v2/run_<timestamp>/simplified_avoidance_final.zip
+python3 src/v2/test.py --model src/v2/models_v2/run_<timestamp>/simplified_avoidance_final.zip
 
 # Fly a waypoint mission
-python fly_mission.py --model models_v2/run_<timestamp>/simplified_avoidance_final.zip --speed 2.0
+python3 src/v2/fly_mission.py --model src/v2/models_v2/run_<timestamp>/simplified_avoidance_final.zip --speed 2.0
 ```
 
 ### With ROS2 Bridge (recommended for training)
 
-```bash
-# Terminal 1 — AirSim ROS2 bridge (Linux / WSL2)
-source AirSim/ros2/install/setup.bash
-ros2 launch airsim_ros_pkgs airsim_node.launch.py host:=<AIRSIM_HOST_IP>
+**Terminal 1 — Unreal Engine:** Open Blocks environment and hit Play.
 
-# Terminal 2 — Training
-python train.py   # avoidance_env.py detects ROS2 topics automatically
+**Terminal 2 — ROS2 AirSim node (Linux):**
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/Cosys-AirSim/ros2/install/setup.bash
+ros2 launch airsim_ros_pkgs airsim_node.launch.py host:=localhost
 ```
 
-See `AIRSIM_ROS2_BRIDGE_SETUP.md` for full setup instructions.
+**Terminal 3 — Training:**
+```bash
+source ~/Sites/ppo-cnn-drone-navigation/venv/bin/activate
+cd ~/Sites/ppo-cnn-drone-navigation
+python3 src/v2/train.py --ros2
+```
+
+**Terminal 4 — TensorBoard:**
+```bash
+source ~/Sites/ppo-cnn-drone-navigation/venv/bin/activate
+cd ~/Sites/ppo-cnn-drone-navigation
+tensorboard --logdir logs_v2
+```
+
+Then open `http://localhost:6006` in your browser.
+
+### TensorBoard Metrics
+
+TensorBoard shows the standard PPO metrics logged automatically by Stable-Baselines3.
+
+**rollout/**
+| Metric | Description |
+|--------|-------------|
+| `ep_rew_mean` | Average episode reward — the main signal to watch, should trend upward |
+| `ep_len_mean` | Average episode length (steps per episode) |
+
+**train/**
+| Metric | Description |
+|--------|-------------|
+| `policy_gradient_loss` | How much the policy is changing each update |
+| `value_loss` | How well the critic estimates future rewards |
+| `entropy_loss` | Exploration level — higher means more random actions |
+| `approx_kl` | How far the new policy drifted from the old one per update |
+| `clip_fraction` | Fraction of updates that hit the PPO clip boundary |
+| `explained_variance` | How well the value function predicts actual returns — closer to 1.0 is better |
+| `learning_rate` | Constant at `1e-4` |
+
+The most important metrics are **`ep_rew_mean`** (is the drone learning to avoid obstacles and reach goals?) and **`explained_variance`** (is the critic learning?). If `ep_rew_mean` is flat or falling, the drone is not improving.
+
+See `AIRSIM_ROS2_BRIDGE_SETUP.md` for full setup instructions (Linux native and Windows + WSL2).
 
 ---
 

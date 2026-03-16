@@ -18,7 +18,7 @@ Depth image: requested alongside RGB in the same API call, used only for the
 import math
 import gymnasium as gym
 from gymnasium import spaces
-import airsim
+import cosysairsim as airsim
 import numpy as np
 import cv2
 

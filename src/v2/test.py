@@ -17,7 +17,7 @@ from avoidance_env import ObstacleAvoidanceEnv
 
 def get_latest_model():
     """Find the latest trained model."""
-    base_dir = "./models_simplified"
+    base_dir = "./models_v2"
     if not os.path.exists(base_dir):
         return None
 
@@ -51,7 +51,7 @@ def get_latest_model():
     return None
 
 
-def test(model_path=None, episodes=5, show_marker=True):
+def test(model_path=None, episodes=5, show_marker=True, use_ros2=False):
     if model_path is None:
         model_path = get_latest_model()
         if model_path is None:
@@ -60,7 +60,20 @@ def test(model_path=None, episodes=5, show_marker=True):
 
     print(f"Loading model from: {model_path}")
 
-    env = ObstacleAvoidanceEnv(show_visual_marker=show_marker)
+    ros2_bridge = None
+    if use_ros2:
+        from ros2_bridge import ROS2CameraBridge
+        ros2_bridge = ROS2CameraBridge()
+        ros2_bridge.start()
+        import time
+        t0 = time.time()
+        while not ros2_bridge.has_frame:
+            if time.time() - t0 > 10:
+                print("WARNING: ROS2 bridge received no frames after 10s.")
+                break
+            time.sleep(0.1)
+
+    env = ObstacleAvoidanceEnv(show_visual_marker=show_marker, ros2_bridge=ros2_bridge)
 
     model = PPO.load(model_path)
 
@@ -123,6 +136,8 @@ def test(model_path=None, episodes=5, show_marker=True):
     print(f"{'=' * 70}")
 
     env.close()
+    if ros2_bridge is not None:
+        ros2_bridge.stop()
 
 
 if __name__ == "__main__":
@@ -133,6 +148,8 @@ if __name__ == "__main__":
                         help='Number of test episodes (default: 5)')
     parser.add_argument('--no-marker', action='store_true',
                         help='Hide the visual goal marker')
+    parser.add_argument('--ros2', action='store_true',
+                        help='Use ROS2 bridge for images (match training setup)')
     args = parser.parse_args()
 
-    test(model_path=args.model, episodes=args.episodes, show_marker=not args.no_marker)
+    test(model_path=args.model, episodes=args.episodes, show_marker=not args.no_marker, use_ros2=args.ros2)

@@ -14,7 +14,7 @@ Press Q to quit.
 
 import argparse
 import time
-import airsim
+import cosysairsim as airsim
 import numpy as np
 import cv2
 

@@ -5,7 +5,7 @@ Subscribes to the same ROS2 topic as the training script and applies the
 identical preprocessing pipeline (BGR→grayscale, resize to 84×84 with
 INTER_AREA) so the display matches exactly what the model receives.
 
-Displays the grayscale frame (84×84, upscaled for visibility) plus,
+Displays the grayscale frame (128×128, upscaled for visibility) plus,
 optionally, the 4-frame stack side-by-side for debugging temporal context.
 
 Usage:
@@ -27,7 +27,7 @@ from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 
 STACK_FRAMES = 4
-IMG_SIZE = 84
+IMG_SIZE = 128
 DISPLAY_SIZE = 400  # upscale for visibility
 
 
@@ -70,8 +70,8 @@ def main(fps: int, show_stack: bool, topic: str):
     wait_ms = max(1, int(1000 / fps))
     frame_stack = np.zeros((STACK_FRAMES, IMG_SIZE, IMG_SIZE), dtype=np.uint8)
 
-    cv2.namedWindow("Drone Camera (84x84 grayscale — model input)", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Drone Camera (84x84 grayscale — model input)", DISPLAY_SIZE, DISPLAY_SIZE)
+    cv2.namedWindow("Drone Camera (128x128 grayscale — model input)", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Drone Camera (128x128 grayscale — model input)", DISPLAY_SIZE, DISPLAY_SIZE)
 
     print(f"Waiting for frames on {topic} ... Press Q to quit.")
 
@@ -90,7 +90,7 @@ def main(fps: int, show_stack: bool, topic: str):
                 else:
                     # INTER_NEAREST keeps the exact 84x84 pixels visible without blurring
                     cv2.imshow(
-                        "Drone Camera (84x84 grayscale — model input)",
+                        "Drone Camera (128x128 grayscale — model input)",
                         cv2.resize(gray, (DISPLAY_SIZE, DISPLAY_SIZE), interpolation=cv2.INTER_NEAREST),
                     )
 

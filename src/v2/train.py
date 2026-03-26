@@ -6,11 +6,13 @@ based on camera input to avoid obstacles.
 Navigation is handled by a simple controller.
 
 Usage:
-    python train.py                          # New training, 200k steps
-    python train.py --steps 500000           # New training, 500k steps
-    python train.py --resume                 # Resume from latest checkpoint
-    python train.py --resume --steps 400000  # Resume, train to 400k total
-    python train.py --ros2                   # Use ROS2 bridge for images (~30 Hz)
+    python train.py                                    # New training, 200k steps
+    python train.py --steps 500000                     # New training, 500k steps
+    python train.py --resume                           # Resume from latest checkpoint
+    python train.py --resume --steps 400000            # Resume, train to 400k total
+    python train.py --ros2                             # Use ROS2 bridge for images (~30 Hz)
+    python train.py --resume --ros2 --density-stage 1  # Resume at sparse+medium density
+    python train.py --resume --ros2 --density-stage 2  # Resume at all densities
 
 Environment variables:
     AIRSIM_HOST   IP of the machine running AirSim (default: localhost).
@@ -33,35 +35,56 @@ class ValidationCallback(BaseCallback):
 
     Uses model.predict(deterministic=True) so results reflect the true
     policy quality, not the stochastic exploration used during training.
-    Logs to validation/success_rate in TensorBoard.
+    Logs to validation/success_rate and curriculum/density_stage in TensorBoard.
+
+    Curriculum advancement: if validation success rate exceeds density_threshold
+    for two consecutive evaluations, the forest density stage is incremented
+    (sparse only → sparse+medium → all densities). Stage is stored on the
+    ObstacleAvoidanceEnv as density_stage and updated via VecEnv.set_attr().
+
+    Validation uses the same training environment and therefore the same
+    density_stage that is active during training — no separate eval env needed.
+    The stage is only advanced *after* all val episodes finish, so all val
+    episodes in one run see a consistent density config.
     """
 
-    def __init__(self, val_episodes=10, val_every_n_episodes=100, verbose=0):
+    STAGE_NAMES = ['sparse only', 'sparse + medium', 'all densities']
+
+    def __init__(self, val_episodes=30, val_every_n_steps=70_000,
+                 density_threshold=0.80, verbose=0):
         super().__init__(verbose)
         self.val_episodes = val_episodes
-        self.val_every_n_episodes = val_every_n_episodes
-        self.episode_count = 0
-        self.last_val_episode = 0
+        self.val_every_n_steps = val_every_n_steps
+        self.density_threshold = density_threshold
+        self.last_val_step = 0
+        self._passes_in_a_row = 0
 
     def _on_step(self) -> bool:
-        for done in self.locals.get('dones', []):
-            if done:
-                self.episode_count += 1
         return True
 
     def _on_rollout_end(self) -> None:
-        if self.episode_count - self.last_val_episode < self.val_every_n_episodes:
+        if self.num_timesteps - self.last_val_step < self.val_every_n_steps:
             return
-        self.last_val_episode = self.episode_count
+        self.last_val_step = self.num_timesteps
 
+        # Read density stage directly from the unwrapped env.
+        # DummyVecEnv.get_attr() / set_attr() operate on the Monitor wrapper, not
+        # on ObstacleAvoidanceEnv itself. Gymnasium's Wrapper.__getattr__ forwards
+        # reads transparently, but set_attr() creates a shadow attribute on Monitor
+        # that the env never sees. Using .unwrapped bypasses all wrappers.
+        current_stage = self.training_env.envs[0].unwrapped.density_stage
         print(f"\n[Validation] Running {self.val_episodes} deterministic episodes "
-              f"(after {self.episode_count} training episodes)...")
+              f"at step {self.num_timesteps:,} | "
+              f"density stage={current_stage} ({self.STAGE_NAMES[current_stage]})...")
 
         env = self.training_env
         successes = 0
 
+        # Reset once before the loop. After each episode ends with done=True,
+        # DummyVecEnv auto-resets and returns the new initial obs from step(),
+        # so the next iteration starts immediately without an extra reset().
+        obs = env.reset()
         for _ in range(self.val_episodes):
-            obs = env.reset()
             done = False
             info = {}
             while not done:
@@ -74,13 +97,87 @@ class ValidationCallback(BaseCallback):
 
         val_success_rate = successes / self.val_episodes
         self.logger.record('validation/success_rate', val_success_rate)
-        self.logger.record('validation/episodes_trained', self.episode_count)
-        self.logger.dump(self.num_timesteps)
+        self.logger.record('validation/step', self.num_timesteps)
+        self.logger.record('curriculum/density_stage', current_stage)
 
         print(f"[Validation] Success rate: {val_success_rate:.0%} "
-              f"({successes}/{self.val_episodes})\n")
+              f"({successes}/{self.val_episodes})")
 
-        env.reset()
+        # Curriculum: advance density stage after 2 consecutive passes above threshold
+        if current_stage < 2:
+            if val_success_rate >= self.density_threshold:
+                self._passes_in_a_row += 1
+                print(f"[Curriculum] Pass {self._passes_in_a_row}/2 "
+                      f"({val_success_rate:.0%} ≥ {self.density_threshold:.0%})")
+                if self._passes_in_a_row >= 2:
+                    new_stage = current_stage + 1
+                    for env in self.training_env.envs:
+                        env.unwrapped.density_stage = new_stage
+                    self._passes_in_a_row = 0
+                    self.logger.record('curriculum/density_stage', new_stage)
+                    print(f"[Curriculum] Density stage advanced to {new_stage}: "
+                          f"{self.STAGE_NAMES[new_stage]}")
+            else:
+                if self._passes_in_a_row > 0:
+                    print(f"[Curriculum] Pass streak reset (was {self._passes_in_a_row})")
+                self._passes_in_a_row = 0
+
+        self.logger.dump(self.num_timesteps)
+        print()
+        # Sync model._last_obs so the next rollout starts from the obs that
+        # DummyVecEnv returned after the last validation episode ended.
+        # When done=True, DummyVecEnv auto-resets and returns the new episode's
+        # initial obs — so `obs` already IS that fresh observation. Assigning
+        # it directly avoids a second reset() call (and a second tree placement)
+        # which was causing the double Goal print at every validation boundary.
+        self.model._last_obs = obs
+
+
+class EntropyScheduleCallback(BaseCallback):
+    """Reduces ent_coef on a fixed step schedule.
+
+    Default schedule:
+        0 steps    → 0.10  (high exploration at start)
+        200k steps → 0.08
+        400k steps → 0.06
+        600k steps → 0.04
+        800k steps → 0.02
+        1M  steps  → 0.01  (held for remainder of training)
+
+    step_offset: shifts the schedule so it runs relative to the current
+    timestep rather than from 0. Use this when resuming at a higher density
+    stage — e.g. resuming at step 1.28M with step_offset=1.28M restarts the
+    full 0.10→0.01 ramp from the current position, giving the policy room to
+    explore the new denser environment.
+    """
+
+    SCHEDULE = [
+        (0,         0.10),
+        (200_000,   0.08),
+        (400_000,   0.06),
+        (600_000,   0.04),
+        (800_000,   0.02),
+        (1_000_000, 0.01),
+    ]
+
+    def __init__(self, step_offset=0, verbose=0):
+        super().__init__(verbose)
+        self._current_stage = -1
+        self.step_offset = step_offset
+
+    def _on_step(self) -> bool:
+        effective_step = self.num_timesteps - self.step_offset
+        stage = 0
+        for i, (threshold, _) in enumerate(self.SCHEDULE):
+            if effective_step >= threshold:
+                stage = i
+        if stage != self._current_stage:
+            coef = self.SCHEDULE[stage][1]
+            self.model.ent_coef = coef
+            self._current_stage = stage
+            print(f"[EntropySchedule] step={self.num_timesteps:,}: ent_coef → {coef}")
+            self.logger.record('train/ent_coef_scheduled', coef)
+        return True
 
 
 class SuccessRateCallback(BaseCallback):
@@ -137,7 +234,7 @@ def get_latest_run_dir(base_dir):
     return os.path.join(base_dir, run_dirs[-1])
 
 
-def train(resume=False, target_steps=None, use_ros2=False):
+def train(resume=False, target_steps=None, use_ros2=False, density_stage=0):
     base_model_dir = "./models_v2"
     base_log_dir = "./logs_v2"
     os.makedirs(base_model_dir, exist_ok=True)
@@ -146,8 +243,8 @@ def train(resume=False, target_steps=None, use_ros2=False):
     print("=" * 70)
     print("OBSTACLE AVOIDANCE TRAINING")
     print("=" * 70)
-    print("\nModel input:  4x grayscale RGB frames (4, 84, 84)")
-    print("Model output: Lateral + vertical correction")
+    print("\nModel input:  4x grayscale frames (4, 128, 128)")
+    print("Model output: Lateral correction only")
     print("Controller:   Flies toward goal automatically")
     image_src = "ROS2 bridge (~30 Hz)" if use_ros2 else "AirSim Python API (~1-5 Hz)"
     print(f"Image source: {image_src}")
@@ -178,6 +275,12 @@ def train(resume=False, target_steps=None, use_ros2=False):
 
     print("\nCreating environment...")
     env = DummyVecEnv([make_env(ros2_bridge=ros2_bridge)])
+
+    if density_stage > 0:
+        for e in env.envs:
+            e.unwrapped.density_stage = density_stage
+        stage_names = ['sparse only', 'sparse + medium', 'all densities']
+        print(f"Density stage set to {density_stage}: {stage_names[density_stage]}")
 
     run_dir = None
     log_dir = None
@@ -236,7 +339,7 @@ def train(resume=False, target_steps=None, use_ros2=False):
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            ent_coef=0.01,
+            ent_coef=0.10,
             vf_coef=0.5,
             max_grad_norm=0.5,
             verbose=1,
@@ -250,7 +353,13 @@ def train(resume=False, target_steps=None, use_ros2=False):
         name_prefix="simplified_avoidance"
     )
     success_callback = SuccessRateCallback(window=50)
-    validation_callback = ValidationCallback(val_episodes=10, val_every_n_episodes=100)
+    validation_callback = ValidationCallback(val_episodes=30, val_every_n_steps=70_000,
+                                             density_threshold=0.80)
+    # When resuming at a higher density stage the entropy schedule would
+    # immediately snap to 0.01 (its value at 1M+ steps). Reset it relative
+    # to the current checkpoint so the policy can explore the new environment.
+    entropy_offset = model.num_timesteps if density_stage > 0 else 0
+    entropy_callback = EntropyScheduleCallback(step_offset=entropy_offset)
 
     total_timesteps = target_steps if target_steps else 200_000
     current_steps = model.num_timesteps if hasattr(model, 'num_timesteps') else 0
@@ -282,7 +391,8 @@ def train(resume=False, target_steps=None, use_ros2=False):
     try:
         model.learn(
             total_timesteps=remaining_timesteps,
-            callback=[checkpoint_callback, success_callback, validation_callback],
+            callback=[checkpoint_callback, success_callback, validation_callback,
+                      entropy_callback],
             progress_bar=True,
             reset_num_timesteps=False,
             tb_log_name="avoidance"
@@ -313,6 +423,11 @@ if __name__ == "__main__":
     parser.add_argument('--ros2', action='store_true',
                         help='Use ROS2 bridge for high-frequency image capture (~30 Hz). '
                              'Requires the AirSim ROS2 node to be running and AIRSIM_HOST set.')
+    parser.add_argument('--density-stage', type=int, default=0, choices=[0, 1, 2],
+                        help='Starting forest density stage: 0=sparse only (default), '
+                             '1=sparse+medium, 2=all densities. '
+                             'Useful when resuming a run that trained on sparse only.')
     args = parser.parse_args()
 
-    train(resume=args.resume, target_steps=args.steps, use_ros2=args.ros2)
+    train(resume=args.resume, target_steps=args.steps, use_ros2=args.ros2,
+          density_stage=args.density_stage)

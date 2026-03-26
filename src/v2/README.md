@@ -16,7 +16,7 @@ without converging.
 └───────────┬────────────────────────┬────────────────────────┘
             │ AirSim Python API      │ AirSim ROS2 Bridge
             │ (reset, arm, takeoff,  │ (continuous image stream
-            │  collision, velocity)  │  at ~20-30 Hz)
+            │  collision, velocity)  │  at ~30 Hz)
             │                        │
             ▼                        ▼
 ┌─────────────────────┐   ┌──────────────────────────┐
@@ -36,6 +36,8 @@ without converging.
 │   PPO + CnnPolicy   │
 │   DummyVecEnv       │
 │   CheckpointCallback│
+│   SuccessRateCallback│
+│   ValidationCallback│
 └─────────────────────┘
 ```
 
@@ -50,13 +52,13 @@ see goal-relative information.
 
 | File | Purpose |
 |------|---------|
-| `avoidance_env.py` | Gymnasium environment — physics, rewards, frame stack |
-| `train.py` | PPO training loop with checkpoint/resume support |
+| `avoidance_env.py` | Gymnasium environment — physics, rewards, frame stack, forest generation |
+| `train.py` | PPO training loop with checkpoint/resume/validation support |
 | `ros2_bridge.py` | Thread-safe ROS2 image subscriber (optional, high-frequency path) |
 | `test.py` | Evaluate a trained model over N episodes |
 | `fly_mission.py` | Fly a multi-waypoint mission with a trained model |
 | `fly_baseline.py` | Controller-only baseline (no RL) for comparison |
-| `view_camera.py` | Debug tool — display live camera feed from AirSim |
+| `view_camera.py` | Debug tool — display live camera feed identical to what the model sees |
 | `monitor_drones.py` | Runtime telemetry monitor |
 | `settings_sample.json` | AirSim `settings.json` template |
 | `AIRSIM_ROS2_BRIDGE_SETUP.md` | Step-by-step ROS2 bridge setup guide |
@@ -91,16 +93,16 @@ observation eliminates one major source of the sim-to-real gap.
 Depth is still fetched every step but is only used internally for the **soft
 proximity penalty reward** (see below). It is never fed to the model.
 
-### 3. Frame Stacking — (4, 84, 84) CHW
+### 3. Frame Stacking — (4, 128, 128) CHW
 
 Four consecutive grayscale frames are stacked along the channel axis,
-producing a `(4, 84, 84)` observation. This gives the CNN temporal context —
+producing a `(4, 128, 128)` observation. This gives the CNN temporal context —
 it can infer whether an obstacle is approaching or receding, and detect motion
 even from a monocular camera.
 
 The observation is already channels-first (CHW). Stable-Baselines3's
 `CnnPolicy` detects this automatically because the first dimension (4) is
-smaller than the spatial dimensions (84), so no `VecTransposeImage` wrapper
+smaller than the spatial dimensions (128), so no `VecTransposeImage` wrapper
 is needed.
 
 **Frame update:** the stack is a rolling window — each step, the oldest frame
@@ -119,9 +121,8 @@ forward view from step 0.
 
 ### 5. Speed Randomisation
 
-Each episode draws a random cruising speed from `speed_range = (1.0, 3.0)
-m/s`. The controller moves at this speed; the model's corrections are applied
-on top.
+Each episode draws a random cruising speed from `speed_range = (1.0, 3.0) m/s`.
+The controller moves at this speed; the model's corrections are applied on top.
 
 **Why:** This is a form of domain randomisation. A model trained at a single
 speed may overfit to the temporal signature of obstacles approaching at that
@@ -186,7 +187,7 @@ The model trained at 1.5 Hz learns to react to motion that has already
 finished by the time it executes an action on a real drone at 30 Hz.
 
 `ros2_bridge.py` solves this by subscribing to the AirSim ROS2 bridge topics,
-which publish at the Unreal Engine render rate (~20–30 Hz). Both the RGB and
+which publish at the Unreal Engine render rate (~30 Hz). Both the RGB and
 depth streams are subscribed in a single background thread and cached. The
 training loop reads the latest frame from memory (a mutex-protected dict
 lookup, sub-millisecond), so the bottleneck shifts away from image capture
@@ -208,12 +209,43 @@ the Python API. This preserves compatibility on machines without ROS2.
 `simGetImages` depth-only API call. Once the topic starts delivering frames,
 the fallback is no longer used.
 
+### 9. Dynamic Forest Generation
+
+Each episode, trees are repositioned into an **ellipse aligned along the
+goal direction**. The ellipse spans the full path length (semi-major axis)
+with a ±10 m lateral corridor (semi-minor axis). Tree density is randomly
+selected each episode:
+
+| Config | Min spacing | Approx trees active |
+|--------|-------------|---------------------|
+| Dense  | 2.0 m       | ~195                |
+| Medium | 3.0 m       | ~87                 |
+| Sparse | 4.0 m       | ~50                 |
+
+Trees that don't fit the chosen density are parked 500 m above the scene.
+
+Tree actors are discovered at startup using `simListSceneObjects()`, filtered
+by `TREE_ACTOR_FILTER = 'StaticMeshActor_UAID_'`. This matches all manually
+placed static mesh actors while excluding landscape, HLOD, PCG, and system
+actors which use different prefixes.
+
+**Minimum recommended trees:** 200. With fewer trees, dense configurations
+will be limited and the forest may look sparse.
+
+### 10. Environment Randomisation
+
+Each episode randomises:
+- **Goal direction** — uniform random angle, fixed distance (50 m)
+- **Episode speed** — uniform draw from `speed_range` (1.0–3.0 m/s)
+- **Forest density** — randomly chosen from dense / medium / sparse
+- **Sun position** — random time of day between 06:00 and 19:59 via `simSetTimeOfDay`
+
 ---
 
 ## Observation Space
 
 ```
-Shape:  (4, 84, 84)   — channels-first (CHW)
+Shape:  (4, 128, 128)   — channels-first (CHW)
 dtype:  uint8
 Range:  [0, 255]
 
@@ -231,11 +263,71 @@ dtype:  float32
 Range:  [-1.0, 1.0]
 
 action[0]: lateral correction  — scaled by lateral_scale (1.0 m/s)
-action[1]: vertical correction — scaled by vertical_scale (0.5 m/s)
+action[1]: vertical correction — scaled by vertical_scale (1.0 m/s)
 ```
 
 The controller always provides full forward velocity toward the goal.
 The model adds corrections perpendicular to the goal direction.
+
+---
+
+## Hyperparameters
+
+### Environment
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `speed_range` | (1.0, 3.0) m/s | Randomised forward speed per episode |
+| `lateral_scale` | 1.0 | Max lateral correction velocity (m/s) |
+| `vertical_scale` | 1.0 | Max vertical correction velocity (m/s) |
+| `cruising_altitude` | -1.5 m | Target altitude (NED, negative = up) |
+| `goal_distance_range` | (50, 50) | Goal distance from origin in metres |
+| `goal_radius` | 5.0 m | Distance to consider goal reached |
+| `max_steps` | 2000 | Steps before episode truncation |
+| `prox_threshold` | 5.0 m | Depth distance that triggers proximity penalty |
+| `stack_frames` | 4 | Number of consecutive frames stacked as observation |
+| `action_momentum` | 0.5 | Blend ratio with previous action (smoothing) |
+
+### PPO (Stable-Baselines3)
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `policy` | CnnPolicy | Convolutional policy for image input |
+| `learning_rate` | 1e-4 | Adam optimizer learning rate |
+| `n_steps` | 2048 | Steps per rollout buffer |
+| `batch_size` | 256 | Minibatch size for gradient updates |
+| `n_epochs` | 5 | Passes over rollout data per update |
+| `gamma` | 0.99 | Discount factor |
+| `gae_lambda` | 0.95 | GAE lambda for advantage estimation |
+| `clip_range` | 0.2 | PPO clipping range |
+| `ent_coef` | 0.01 | Entropy coefficient (exploration) |
+| `vf_coef` | 0.5 | Value function loss coefficient |
+| `max_grad_norm` | 0.5 | Gradient clipping |
+
+### Camera / Observation
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Source | RGB Scene (ImageType 0) | Captured as colour, converted to grayscale |
+| Resolution | 128×128 | Per frame, matches CnnPolicy input |
+| Channels | 4 stacked frames | Observation shape: (4, 128, 128) CHW |
+| FOV | 120 degrees | Wide angle for obstacle detection |
+| Camera position | X=0.25, Z=-0.1 | Front-center, slightly above body |
+| Depth (reward only) | ImageType 2, raw metres | Used for proximity penalty, not fed to model |
+
+---
+
+## Altitude Hold
+
+A P-controller maintains cruising altitude:
+```
+altitude_error = cruising_altitude - current_z
+base_vz = clip(altitude_error * 0.2, -1.0, 1.0)
+body_vz = base_vz + vertical_correction
+```
+
+The model can add vertical corrections on top, but is clamped when already
+above cruising altitude to prevent runaway climbs.
 
 ---
 
@@ -252,67 +344,83 @@ cd ~/Sites/ppo-cnn-drone-navigation
 # Train (new run, 200k steps)
 python3 src/v2/train.py
 
+# Train with ROS2 bridge (recommended — 30 Hz image capture)
+python3 src/v2/train.py --ros2
+
+# Train for 1M steps
+python3 src/v2/train.py --ros2 --steps 1000000
+
 # Resume from latest checkpoint
-python3 src/v2/train.py --resume
+python3 src/v2/train.py --resume --ros2
 
-# Test a trained model
-python3 src/v2/test.py --model src/v2/models_v2/run_<timestamp>/simplified_avoidance_final.zip
+# Test a trained model (5 episodes)
+python3 src/v2/test.py
 
-# Fly a waypoint mission
-python3 src/v2/fly_mission.py --model src/v2/models_v2/run_<timestamp>/simplified_avoidance_final.zip --speed 2.0
+# Test a specific model (20 episodes)
+python3 src/v2/test.py --model models_v2/run_<timestamp>/simplified_avoidance_final.zip --episodes 20
+
+# View the live camera feed (same preprocessing as the model sees)
+python3 src/v2/view_camera.py --ros2
+python3 src/v2/view_camera.py --ros2 --stack   # show all 4 stacked frames
 ```
 
 ### With ROS2 Bridge (recommended for training)
 
-**Terminal 1 — Unreal Engine:** Open Blocks environment and hit Play.
+**Terminal 1 — Unreal Engine:** Open your environment and hit Play.
 
-**Terminal 2 — ROS2 AirSim node (Linux):**
+**Terminal 2 — ROS2 AirSim node:**
 ```bash
 source /opt/ros/jazzy/setup.bash
 source ~/Cosys-AirSim/ros2/install/setup.bash
-ros2 launch airsim_ros_pkgs airsim_node.launch.py host:=localhost
+ros2 launch airsim_ros_pkgs airsim_node.launch.py host_ip:=localhost
 ```
 
 **Terminal 3 — Training:**
 ```bash
 source ~/Sites/ppo-cnn-drone-navigation/venv/bin/activate
 cd ~/Sites/ppo-cnn-drone-navigation
-python3 src/v2/train.py --ros2
+python3 src/v2/train.py --ros2 --steps 1000000
 ```
 
 **Terminal 4 — TensorBoard:**
 ```bash
 source ~/Sites/ppo-cnn-drone-navigation/venv/bin/activate
-cd ~/Sites/ppo-cnn-drone-navigation
 tensorboard --logdir logs_v2
 ```
 
 Then open `http://localhost:6006` in your browser.
 
-### TensorBoard Metrics
+---
 
-TensorBoard shows the standard PPO metrics logged automatically by Stable-Baselines3.
+## TensorBoard Metrics
 
 **rollout/**
 | Metric | Description |
 |--------|-------------|
-| `ep_rew_mean` | Average episode reward — the main signal to watch, should trend upward |
-| `ep_len_mean` | Average episode length (steps per episode) |
+| `ep_rew_mean` | Average episode reward — main signal, should trend upward |
+| `ep_len_mean` | Average episode length |
+| `success_rate` | Rolling success rate over the last 50 training episodes |
+| `episodes` | Total training episodes completed |
+
+**validation/**
+| Metric | Description |
+|--------|-------------|
+| `success_rate` | Deterministic success rate over 10 episodes, logged every 100 training episodes |
+| `episodes_trained` | Training episodes elapsed when validation ran |
 
 **train/**
 | Metric | Description |
 |--------|-------------|
-| `policy_gradient_loss` | How much the policy is changing each update |
+| `policy_gradient_loss` | How much the policy changes each update |
 | `value_loss` | How well the critic estimates future rewards |
-| `entropy_loss` | Exploration level — higher means more random actions |
-| `approx_kl` | How far the new policy drifted from the old one per update |
-| `clip_fraction` | Fraction of updates that hit the PPO clip boundary |
-| `explained_variance` | How well the value function predicts actual returns — closer to 1.0 is better |
-| `learning_rate` | Constant at `1e-4` |
+| `entropy_loss` | Exploration level |
+| `approx_kl` | Policy drift per update |
+| `clip_fraction` | Fraction of updates hitting the PPO clip boundary |
+| `explained_variance` | Critic quality — closer to 1.0 is better |
 
-The most important metrics are **`ep_rew_mean`** (is the drone learning to avoid obstacles and reach goals?) and **`explained_variance`** (is the critic learning?). If `ep_rew_mean` is flat or falling, the drone is not improving.
-
-See `AIRSIM_ROS2_BRIDGE_SETUP.md` for full setup instructions (Linux native and Windows + WSL2).
+`rollout/success_rate` tracks stochastic training episodes (includes exploration noise).
+`validation/success_rate` uses `deterministic=True` and is the better indicator of true
+policy quality.
 
 ---
 
@@ -325,9 +433,25 @@ Key parameters:
 "ClockSpeed": 10.0    // Speed up simulation for faster training
 "ImageType": 0        // Scene (RGB) — used for observations
 "ImageType": 2        // DepthPerspective — used for proximity penalty
-"Width": 256          // Native render resolution (downsampled to 84x84 in code)
+"Width": 256          // Native render resolution (downsampled to 128x128 in code)
 "Height": 256
+"TargetFPS": 30       // Cap render rate to match ROS2 bridge target frequency
 "FOV_Degrees": 120    // Wide FOV for better peripheral obstacle detection
+```
+
+---
+
+## Output Directories
+
+```
+models_v2/
+  run_YYYY-MM-DD_HH-MM-SS/
+    checkpoints/                    # Saved every 30k steps
+    simplified_avoidance_final.zip  # Final model
+
+logs_v2/
+  run_YYYY-MM-DD_HH-MM-SS/
+    tensorboard/                    # TensorBoard logs
 ```
 
 ---
@@ -337,9 +461,25 @@ Key parameters:
 Per-step timing is printed every 25 steps to help diagnose bottlenecks:
 
 ```
-[TIMING ms] pos1=4.2 move=1.1 images=612.3 collision=3.8 pos2=4.0 total=625.4 (~1.6 Hz)
+[TIMING ms] pos1=4.2 move=1.1 images=612.3 collision=3.8 pos2=4.0 compute=625.4 (~1.6 Hz)
 [IMG-API ms] simGetImages=609.7
 ```
 
-With the ROS2 bridge active, `images=` drops from ~600 ms to < 1 ms and
-`depth_ros2=` replaces `depth_api=`.
+With the ROS2 bridge active, `images=` drops from ~600 ms to < 1 ms:
+
+```
+[TIMING ms] pos1=3.1 move=0.9 images=0.1 collision=3.5 pos2=3.2 compute=10.8 (~30 Hz)
+[IMG-ROS2 ms] rgb_cache=0.1 depth_ros2=0.1
+```
+
+---
+
+## Requirements
+
+- Python 3.10+
+- PyTorch 2.0+
+- Stable-Baselines3 2.0+
+- Cosys-AirSim Python client (`cosysairsim`)
+- Unreal Engine 5.5 with Cosys-AirSim plugin
+- ROS2 Jazzy (optional, for 30 Hz image capture)
+- CUDA GPU (recommended)

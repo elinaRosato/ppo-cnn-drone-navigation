@@ -54,7 +54,7 @@ class ROS2CameraBridge:
         self,
         image_topic: str = '/airsim_node/SimpleFlight/front_center_Scene/image',
         depth_topic: str = '/airsim_node/SimpleFlight/front_center_DepthPerspective/image',
-        target_size: tuple = (84, 84),
+        target_size: tuple = (128, 128),
     ):
         """
         Parameters

@@ -5,11 +5,12 @@ Navigation is handled by a simple controller (go toward goal).
 The RL model ONLY learns obstacle avoidance from the camera image.
 
 Controller: flies forward toward goal at episode_speed (randomised each reset)
-RL Model:   sees 4 stacked grayscale frames, outputs lateral + vertical correction
-Combined:   velocity = forward_toward_goal + lateral_perpendicular + altitude_hold
+RL Model:   sees 4 stacked grayscale frames, outputs lateral correction only
+Combined:   velocity = forward_toward_goal + lateral_perpendicular
+Altitude:   held by a P-controller (not learned) — vertical output removed from action space
 Yaw:        faces actual movement direction (camera sees what's ahead)
 
-Observation: (4, 84, 84) uint8 — 4 stacked grayscale frames, channels-first (CHW)
+Observation: (4, 128, 128) uint8 — 4 stacked grayscale frames, channels-first (CHW)
              No VecTransposeImage needed; SB3 CnnPolicy detects CHW automatically.
 Depth image: requested alongside RGB in the same API call, used only for the
              soft proximity penalty reward (not fed to the model).
@@ -21,12 +22,18 @@ ROS2 bridge: if a ROS2CameraBridge instance is passed as ros2_bridge, RGB frames
 
 import math
 import os
+import random
 import time
 import gymnasium as gym
 from gymnasium import spaces
 import cosysairsim as airsim
 import numpy as np
 import cv2
+
+
+# Substring matched against simListSceneObjects() to identify tree actors.
+# All tree actors must have Movable mobility in Unreal (Details → Transform → ⚡).
+TREE_ACTOR_FILTER = 'StaticMeshActor_UAID_'
 
 
 class ObstacleAvoidanceEnv(gym.Env):
@@ -36,10 +43,9 @@ class ObstacleAvoidanceEnv(gym.Env):
 
     def __init__(self,
                  goal_distance_range=(50, 50),
-                 cruising_altitude=-1.5,
+                 cruising_altitude=-1.3,
                  speed_range=(1.0, 3.0),
                  lateral_scale=1.0,
-                 vertical_scale=1.0,
                  goal_radius=5.0,
                  max_steps=2000,
                  step_hz=30.0,
@@ -51,15 +57,14 @@ class ObstacleAvoidanceEnv(gym.Env):
         self.cruising_altitude = cruising_altitude
         self.speed_range = speed_range
         self.lateral_scale = lateral_scale
-        self.vertical_scale = vertical_scale
         self.goal_radius = goal_radius
         self.max_steps = max_steps
         self.step_hz = step_hz
         self.show_visual_marker = show_visual_marker
         self.ros2_bridge = ros2_bridge
 
-        self.img_height = 84
-        self.img_width = 84
+        self.img_height = 128
+        self.img_width = 128
         self.stack_frames = 4
 
         # Soft proximity penalty threshold (metres)
@@ -73,10 +78,29 @@ class ObstacleAvoidanceEnv(gym.Env):
         self.client.confirmConnection()
         host_str = airsim_host if airsim_host else 'localhost'
         print(f"Connected to AirSim at {host_str}!")
+        # Brief pause to let AirSim finish registering all physics actors,
+        # especially important right after a fresh Unreal Editor session.
+        time.sleep(2.0)
 
         self.camera_name = "front_center"
         self.goal_pos = None
         self.episode_speed = float(np.mean(speed_range))  # placeholder until first reset
+
+        # Discover tree actors by FName from simListSceneObjects.
+        # Requires all tree actors to have Movable mobility in Unreal.
+        all_objects = self.client.simListSceneObjects()
+        self.tree_names = [o for o in all_objects if TREE_ACTOR_FILTER in o]
+        print(f"Found {len(self.tree_names)} tree actors in scene.")
+        if len(self.tree_names) == 0:
+            print("  WARNING: no trees found. Check TREE_ACTOR_FILTER matches your actor names.")
+
+        # Sample ground z from the first tree's current position.
+        # The ground in this level is not at z=0 in world coordinates.
+        self.ground_z = 0.0
+        if self.tree_names:
+            sample_pose = self.client.simGetObjectPose(self.tree_names[0])
+            self.ground_z = sample_pose.position.z_val
+            print(f"Ground z sampled from tree: {self.ground_z:.2f}")
 
         # Observation: 4 stacked grayscale frames in CHW format.
         # SB3 CnnPolicy expects (C, H, W); first dim (4) < spatial dims (84)
@@ -88,21 +112,115 @@ class ObstacleAvoidanceEnv(gym.Env):
             dtype=np.uint8
         )
 
-        # Action: lateral correction + vertical correction
+        # Action: lateral correction only.
+        # Vertical is handled by the altitude hold P-controller (not learned).
         self.action_space = spaces.Box(
             low=-1.0,
             high=1.0,
-            shape=(2,),
+            shape=(1,),
             dtype=np.float32
         )
+
+        # Forest density curriculum (advanced by ValidationCallback).
+        # 0 = sparse only, 1 = sparse + medium, 2 = all densities
+        self.density_stage = 0
 
         self.frame_stack = np.zeros(
             (self.stack_frames, self.img_height, self.img_width), dtype=np.uint8
         )
-        self.prev_action = np.zeros(2, dtype=np.float32)
+        self.prev_action = np.zeros(1, dtype=np.float32)
         self.current_step = 0
         self.episode_reward = 0.0
         self.collision_count = 0
+
+    def _place_trees(self, goal_x, goal_y):
+        """Reposition ALL trees each episode in a density-scaled ellipse.
+
+        All trees are always placed — no parking needed, which avoids Unreal's
+        world-partition streaming problem (trees parked far away/underground
+        become inaccessible via simSetObjectPose in subsequent episodes).
+
+        The ellipse semi-axes scale so that all len(tree_names) trees fit at
+        the chosen min_dist spacing:
+          Stage 0: sparse only  (15 m → large ellipse)
+          Stage 1: sparse + medium (15 m or 10 m)
+          Stage 2: sparse + medium + dense (6 m → compact ellipse)
+
+        Dense forests are compact; sparse forests cover a wider area.
+        """
+        ALL_DENSITY_CONFIGS = [
+            ('sparse', 15.0),
+            ('medium', 10.0),
+            ('dense',   6.0),
+        ]
+        active_configs = ALL_DENSITY_CONFIGS[:self.density_stage + 1]
+        label, min_dist = random.choice(active_configs)
+
+        n_trees = len(self.tree_names)
+        DRONE_CLEARANCE = 8.0   # min distance from drone spawn at (0, 0)
+        GOAL_CLEARANCE  = 8.0   # min distance from goal position
+
+        # Base ellipse with drone start and goal as focal points.
+        goal_distance = math.sqrt(goal_x ** 2 + goal_y ** 2)
+        extension = 10.0
+        c = goal_distance / 2
+        base_a = c + extension
+        base_b = math.sqrt(max(base_a ** 2 - c ** 2, 1.0))
+
+        # Scale semi-axes so all n_trees fit at min_dist spacing.
+        # Random packing efficiency ≈ 0.55 (conservative to keep rejection rate low).
+        required_area = n_trees * (min_dist ** 2) / 0.55
+        base_area = math.pi * base_a * base_b
+        scale = max(1.0, math.sqrt(required_area / base_area))
+        a = base_a * scale
+        b = base_b * scale
+
+        goal_angle = math.atan2(goal_y, goal_x)
+        cos_a, sin_a = math.cos(goal_angle), math.sin(goal_angle)
+        cx, cy = goal_x / 2.0, goal_y / 2.0
+
+        # Rejection sampling — place ALL trees within the scaled ellipse
+        placed = []
+        max_attempts = n_trees * 300
+        attempts = 0
+        while len(placed) < n_trees and attempts < max_attempts:
+            attempts += 1
+            r = math.sqrt(random.random())
+            theta = random.uniform(0, 2 * math.pi)
+            lx = r * a * math.cos(theta)
+            ly = r * b * math.sin(theta)
+            wx = cx + cos_a * lx - sin_a * ly
+            wy = cy + sin_a * lx + cos_a * ly
+            if math.sqrt(wx * wx + wy * wy) < DRONE_CLEARANCE:
+                continue
+            if math.sqrt((wx - goal_x) ** 2 + (wy - goal_y) ** 2) < GOAL_CLEARANCE:
+                continue
+            if all(math.sqrt((wx - px) ** 2 + (wy - py) ** 2) >= min_dist
+                   for px, py in placed):
+                placed.append((wx, wy))
+
+        print(f"  Forest: {label} ({len(placed)}/{n_trees} trees, "
+              f"min spacing {min_dist}m, ellipse {a:.0f}×{b:.0f}m)")
+
+        ok = 0
+        fail = 0
+        for i, name in enumerate(self.tree_names):
+            if i < len(placed):
+                x, y = placed[i]
+            else:
+                # Rejection sampling exhausted — overlap remaining trees with last placed
+                # (extremely rare with properly scaled ellipse)
+                x, y = placed[-1] if placed else (cx, cy)
+            pose = airsim.Pose(
+                airsim.Vector3r(x, y, self.ground_z),
+                airsim.Quaternionr(0, 0, 0, 1)
+            )
+            if self.client.simSetObjectPose(name, pose, teleport=True):
+                ok += 1
+            else:
+                fail += 1
+        print(f"  Tree placement: {ok} moved, {fail} failed"
+              + (f" (first failed: {self.tree_names[ok]})" if fail > 0 else ""))
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -127,10 +245,36 @@ class ObstacleAvoidanceEnv(gym.Env):
         except Exception:
             pass
 
-        # Reset drone, arm, take off, climb to cruising altitude
+        # Reset drone first so AirSim is in a clean state before we reposition trees.
+        # Placing trees before reset() causes failures on episodes > 0 because AirSim
+        # is still in an end-of-episode (collision/active) state when simSetObjectPose
+        # is called. After reset(), AirSim is fully initialised and all actors accept
+        # teleport commands reliably.
         self.client.reset()
+
+        # Random sun position via time of day (must be after reset()).
+        # move_sun=True is required — without it AirSim updates the clock but
+        # does not reposition the sun in the scene.
+        hour = random.randint(6, 19)
+        minute = random.randint(0, 59)
+        self.client.simSetTimeOfDay(
+            True,
+            start_datetime=f"2025-06-15 {hour:02d}:{minute:02d}:00",
+            is_start_datetime_dst=True,
+            celestial_clock_speed=1,
+            update_interval_secs=0,
+            move_sun=True
+        )
         self.client.enableApiControl(True)
         self.client.armDisarm(True)
+        # Give AirSim a moment to finish reinitialising actor physics after reset.
+        # Without this, simSetObjectPose returns False for ~194 of the tree actors.
+        time.sleep(1.0)
+
+        # Reposition trees after the AirSim reset so all actors are in a clean state.
+        if self.tree_names:
+            self._place_trees(goal_x, goal_y)
+
         self.client.takeoffAsync().join()
         self.client.moveToZAsync(self.cruising_altitude, 2.0).join()
 
@@ -141,6 +285,11 @@ class ObstacleAvoidanceEnv(gym.Env):
         goal_yaw = math.degrees(math.atan2(goal_y, goal_x))
         self.client.rotateToYawAsync(goal_yaw, timeout_sec=5.0).join()
         time.sleep(0.2)  # let angular velocity settle after rotation
+
+        # AirSim sets has_collided=True when the drone spawns on the ground
+        # after reset(). The drone is now airborne, so read collision once to
+        # flush the stale flag before the first step() call checks it.
+        self.client.simGetCollisionInfo()
 
         if self.show_visual_marker:
             self.client.simFlushPersistentMarkers()
@@ -155,7 +304,7 @@ class ObstacleAvoidanceEnv(gym.Env):
         self.current_step = 0
         self.episode_reward = 0.0
         self.collision_count = 0
-        self.prev_action = np.zeros(2, dtype=np.float32)
+        self.prev_action = np.zeros(1, dtype=np.float32)
 
         # Fill the frame stack with the first captured frame (no motion yet,
         # but already facing the goal after rotateToYaw above)
@@ -185,9 +334,8 @@ class ObstacleAvoidanceEnv(gym.Env):
         ux, uy = dx / dist_xy, dy / dist_xy
         px, py = -uy, ux
 
-        # RL correction mapped to world frame
+        # RL correction mapped to world frame (lateral only)
         lateral = float(action[0]) * self.lateral_scale
-        vertical = float(action[1]) * self.vertical_scale
 
         # Combined velocity: forward toward goal + lateral perpendicular
         vel_x = self.episode_speed * ux + lateral * px
@@ -202,12 +350,9 @@ class ObstacleAvoidanceEnv(gym.Env):
         body_vx = speed_xy
         body_vy = 0.0
 
-        # Altitude hold
+        # Altitude hold P-controller (not learned)
         altitude_error = self.cruising_altitude - position[2]
-        base_vz = float(np.clip(altitude_error * 0.2, -1.0, 1.0))
-        body_vz = base_vz + vertical
-        if position[2] > self.cruising_altitude + 1.0:
-            body_vz = min(body_vz, base_vz)
+        body_vz = float(np.clip(altitude_error * 0.2, -1.0, 1.0))
 
         t0 = time.perf_counter()
         self.client.moveByVelocityBodyFrameAsync(
@@ -254,7 +399,7 @@ class ObstacleAvoidanceEnv(gym.Env):
         if self.current_step % 25 == 1:
             print(f"  Step {self.current_step}: dist={dist_xy:.1f}m "
                   f"speed={self.episode_speed:.1f}m/s "
-                  f"action=({action[0]:.2f},{action[1]:.2f})")
+                  f"lateral={action[0]:.2f}")
             print(f"  [TIMING ms] pos1={t_get_pos1*1000:.1f} "
                   f"move={t_move_cmd*1000:.1f} "
                   f"images={t_images*1000:.1f} "

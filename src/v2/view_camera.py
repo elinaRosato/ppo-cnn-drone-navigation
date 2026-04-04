@@ -149,8 +149,8 @@ def main(fps: int, show_stack: bool, show_depth: bool,
                      DISPLAY_SIZE, DISPLAY_SIZE)
 
     if show_depth:
-        cv2.namedWindow("Depth — 0–5 m clipped (reward signal)", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Depth — 0–5 m clipped (reward signal)",
+        cv2.namedWindow("Depth — 0–2.5 m clipped (reward signal)", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Depth — 0–2.5 m clipped (reward signal)",
                          DISPLAY_SIZE, DISPLAY_SIZE)
 
     print(f"Waiting for frames on {scene_topic} ... Press Q to quit.")
@@ -176,7 +176,7 @@ def main(fps: int, show_stack: bool, show_depth: bool,
                     )
 
             if show_depth and depth is not None:
-                cv2.imshow("Depth — 0–5 m clipped (reward signal)",
+                cv2.imshow("Depth — 0–2.5 m clipped (reward signal)",
                            render_depth(depth, DISPLAY_SIZE))
 
             if cv2.waitKey(wait_ms) & 0xFF == ord('q'):

@@ -27,11 +27,29 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.policies import ActorCriticCnnPolicy
 import torch
 
 
+class BoundedStdCnnPolicy(ActorCriticCnnPolicy):
+    """CnnPolicy where action std is hard-capped at 1.0 (the action range width).
+
+    SB3's default LOG_STD_MAX=2 allows std up to ~7.4, causing sampled actions
+    to be almost always clipped to ±1 — exploration wastes its budget outside
+    the valid range. Overriding _get_action_dist_from_latent to clamp log_std
+    keeps std within [0.01, 1.0] so exploration stays meaningful inside [-1, 1].
+    """
+    _LOG_STD_MAX = 0.0   # e^0    = 1.0  — std never exceeds the action range
+    _LOG_STD_MIN = -4.6  # e^-4.6 ≈ 0.01 — still allows tight exploitation
+
+    def _get_action_dist_from_latent(self, latent_pi):
+        mean_actions = self.action_net(latent_pi)
+        log_std = torch.clamp(self.log_std, self._LOG_STD_MIN, self._LOG_STD_MAX)
+        return self.action_dist.proba_distribution(mean_actions, log_std)
+
+
 class ValidationCallback(BaseCallback):
-    """Runs deterministic validation episodes every N training episodes.
+    """Runs deterministic validation episodes every N training steps.
 
     Uses model.predict(deterministic=True) so results reflect the true
     policy quality, not the stochastic exploration used during training.
@@ -42,6 +60,13 @@ class ValidationCallback(BaseCallback):
     (sparse only → sparse+medium → all densities). Stage is stored on the
     ObstacleAvoidanceEnv as density_stage and updated via VecEnv.set_attr().
 
+    Adaptive entropy: ent_coef adjusts based on whether validation improved or
+    declined compared to the previous validation:
+      - Improved → decay by entropy_decay_rate (exploit more)
+      - Declined → raise by entropy_rise_rate (explore more)
+    Capped at entropy_max and floored at entropy_min. On curriculum stage
+    advance, ent_coef resets to entropy_max to explore the new environment.
+
     Validation uses the same training environment and therefore the same
     density_stage that is active during training — no separate eval env needed.
     The stage is only advanced *after* all val episodes finish, so all val
@@ -51,13 +76,21 @@ class ValidationCallback(BaseCallback):
     STAGE_NAMES = ['sparse only', 'sparse + medium', 'all densities']
 
     def __init__(self, val_episodes=30, val_every_n_steps=70_000,
-                 density_threshold=0.80, verbose=0):
+                 density_threshold=0.80,
+                 entropy_decay_rate=0.85, entropy_rise_rate=1.20,
+                 entropy_min=0.01, entropy_max=0.05,
+                 verbose=0):
         super().__init__(verbose)
         self.val_episodes = val_episodes
         self.val_every_n_steps = val_every_n_steps
         self.density_threshold = density_threshold
+        self.entropy_decay_rate = entropy_decay_rate
+        self.entropy_rise_rate = entropy_rise_rate
+        self.entropy_min = entropy_min
+        self.entropy_max = entropy_max
         self.last_val_step = 0
         self._passes_in_a_row = 0
+        self._prev_val_success = None
 
     def _on_step(self) -> bool:
         return True
@@ -79,6 +112,8 @@ class ValidationCallback(BaseCallback):
 
         env = self.training_env
         successes = 0
+        val_avg_laterals = []
+        val_avg_abs_laterals = []
 
         # Reset once before the loop. After each episode ends with done=True,
         # DummyVecEnv auto-resets and returns the new initial obs from step(),
@@ -94,14 +129,35 @@ class ValidationCallback(BaseCallback):
                 info = infos[0]
             if info.get('goal_reached', False):
                 successes += 1
+            if 'avg_lateral' in info:
+                val_avg_laterals.append(info['avg_lateral'])
+                val_avg_abs_laterals.append(info['avg_abs_lateral'])
 
         val_success_rate = successes / self.val_episodes
         self.logger.record('validation/success_rate', val_success_rate)
         self.logger.record('validation/step', self.num_timesteps)
         self.logger.record('curriculum/density_stage', current_stage)
+        if val_avg_laterals:
+            self.logger.record('validation/lateral_avg', sum(val_avg_laterals) / len(val_avg_laterals))
+            self.logger.record('validation/lateral_abs_avg', sum(val_avg_abs_laterals) / len(val_avg_abs_laterals))
 
         print(f"[Validation] Success rate: {val_success_rate:.0%} "
               f"({successes}/{self.val_episodes})")
+
+        # Adaptive entropy: decay if validation improved, raise if it declined
+        if self._prev_val_success is None:
+            new_ent_coef = self.model.ent_coef
+            direction = "→ (first validation, no change)"
+        elif val_success_rate >= self._prev_val_success:
+            new_ent_coef = max(self.model.ent_coef * self.entropy_decay_rate, self.entropy_min)
+            direction = f"↓ (improved {self._prev_val_success:.0%} → {val_success_rate:.0%})"
+        else:
+            new_ent_coef = min(self.model.ent_coef * self.entropy_rise_rate, self.entropy_max)
+            direction = f"↑ (declined {self._prev_val_success:.0%} → {val_success_rate:.0%})"
+        self._prev_val_success = val_success_rate
+        self.model.ent_coef = new_ent_coef
+        self.logger.record('train/ent_coef', new_ent_coef)
+        print(f"[Entropy] ent_coef → {new_ent_coef:.4f}  {direction}")
 
         # Curriculum: advance density stage after 2 consecutive passes above threshold
         if current_stage < 2:
@@ -133,51 +189,6 @@ class ValidationCallback(BaseCallback):
         self.model._last_obs = obs
 
 
-class EntropyScheduleCallback(BaseCallback):
-    """Reduces ent_coef on a fixed step schedule.
-
-    Default schedule:
-        0 steps    → 0.10  (high exploration at start)
-        200k steps → 0.08
-        400k steps → 0.06
-        600k steps → 0.04
-        800k steps → 0.02
-        1M  steps  → 0.01  (held for remainder of training)
-
-    step_offset: shifts the schedule so it runs relative to the current
-    timestep rather than from 0. Use this when resuming at a higher density
-    stage — e.g. resuming at step 1.28M with step_offset=1.28M restarts the
-    full 0.10→0.01 ramp from the current position, giving the policy room to
-    explore the new denser environment.
-    """
-
-    SCHEDULE = [
-        (0,         0.10),
-        (200_000,   0.08),
-        (400_000,   0.06),
-        (600_000,   0.04),
-        (800_000,   0.02),
-        (1_000_000, 0.01),
-    ]
-
-    def __init__(self, step_offset=0, verbose=0):
-        super().__init__(verbose)
-        self._current_stage = -1
-        self.step_offset = step_offset
-
-    def _on_step(self) -> bool:
-        effective_step = self.num_timesteps - self.step_offset
-        stage = 0
-        for i, (threshold, _) in enumerate(self.SCHEDULE):
-            if effective_step >= threshold:
-                stage = i
-        if stage != self._current_stage:
-            coef = self.SCHEDULE[stage][1]
-            self.model.ent_coef = coef
-            self._current_stage = stage
-            print(f"[EntropySchedule] step={self.num_timesteps:,}: ent_coef → {coef}")
-            self.logger.record('train/ent_coef_scheduled', coef)
-        return True
 
 
 class SuccessRateCallback(BaseCallback):
@@ -193,6 +204,8 @@ class SuccessRateCallback(BaseCallback):
         self.window = window
         self.episode_count = 0
         self.outcomes = []  # rolling window: 1 = success, 0 = failure
+        self.avg_laterals = []
+        self.avg_abs_laterals = []
 
     def _on_step(self) -> bool:
         dones = self.locals.get('dones', [])
@@ -203,10 +216,20 @@ class SuccessRateCallback(BaseCallback):
                 self.outcomes.append(1 if info.get('goal_reached', False) else 0)
                 if len(self.outcomes) > self.window:
                     self.outcomes.pop(0)
+                if 'avg_lateral' in info:
+                    self.avg_laterals.append(info['avg_lateral'])
+                    self.avg_abs_laterals.append(info['avg_abs_lateral'])
+                    if len(self.avg_laterals) > self.window:
+                        self.avg_laterals.pop(0)
+                        self.avg_abs_laterals.pop(0)
+
                 if self.episode_count % self.window == 0:
                     success_rate = sum(self.outcomes) / len(self.outcomes)
                     self.logger.record('rollout/success_rate', success_rate)
                     self.logger.record('rollout/episodes', self.episode_count)
+                    if self.avg_laterals:
+                        self.logger.record('rollout/lateral_avg', sum(self.avg_laterals) / len(self.avg_laterals))
+                        self.logger.record('rollout/lateral_abs_avg', sum(self.avg_abs_laterals) / len(self.avg_abs_laterals))
         return True
 
 from avoidance_env import ObstacleAvoidanceEnv
@@ -303,9 +326,10 @@ def train(resume=False, target_steps=None, use_ros2=False, density_stage=0):
                 log_dir = os.path.join(base_log_dir, run_name, "tensorboard")
 
                 print(f"\nResuming from checkpoint: {latest_checkpoint}")
-                model = PPO.load(latest_checkpoint, env=env, device=device)
-                model.ent_coef = 0.01
+                model = PPO.load(latest_checkpoint, env=env, device=device,
+                                 custom_objects={"policy_class": BoundedStdCnnPolicy})
                 model.tensorboard_log = log_dir
+                print(f"   Resuming with ent_coef: {model.ent_coef:.4f}")
                 checkpoint_steps = int(latest_checkpoint.split('_')[-2])
                 model.num_timesteps = checkpoint_steps
                 model._num_timesteps_at_start = checkpoint_steps
@@ -330,7 +354,7 @@ def train(resume=False, target_steps=None, use_ros2=False, density_stage=0):
 
         print("\nCreating new model (CnnPolicy)")
         model = PPO(
-            "CnnPolicy",
+            BoundedStdCnnPolicy,
             env,
             learning_rate=1e-4,
             n_steps=2048,
@@ -339,7 +363,7 @@ def train(resume=False, target_steps=None, use_ros2=False, density_stage=0):
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            ent_coef=0.10,
+            ent_coef=0.05,
             vf_coef=0.5,
             max_grad_norm=0.5,
             verbose=1,
@@ -355,11 +379,6 @@ def train(resume=False, target_steps=None, use_ros2=False, density_stage=0):
     success_callback = SuccessRateCallback(window=50)
     validation_callback = ValidationCallback(val_episodes=30, val_every_n_steps=70_000,
                                              density_threshold=0.80)
-    # When resuming at a higher density stage the entropy schedule would
-    # immediately snap to 0.01 (its value at 1M+ steps). Reset it relative
-    # to the current checkpoint so the policy can explore the new environment.
-    entropy_offset = model.num_timesteps if density_stage > 0 else 0
-    entropy_callback = EntropyScheduleCallback(step_offset=entropy_offset)
 
     total_timesteps = target_steps if target_steps else 200_000
     current_steps = model.num_timesteps if hasattr(model, 'num_timesteps') else 0
@@ -391,8 +410,7 @@ def train(resume=False, target_steps=None, use_ros2=False, density_stage=0):
     try:
         model.learn(
             total_timesteps=remaining_timesteps,
-            callback=[checkpoint_callback, success_callback, validation_callback,
-                      entropy_callback],
+            callback=[checkpoint_callback, success_callback, validation_callback],
             progress_bar=True,
             reset_num_timesteps=False,
             tb_log_name="avoidance"

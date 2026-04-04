@@ -44,9 +44,9 @@ class ObstacleAvoidanceEnv(gym.Env):
     def __init__(self,
                  goal_distance_range=(50, 50),
                  cruising_altitude=-1.3,
-                 speed_range=(1.0, 3.0),
+                 speed_range=(0.5, 1.5),
                  lateral_scale=1.0,
-                 goal_radius=5.0,
+                 goal_radius=2.0,
                  max_steps=2000,
                  step_hz=30.0,
                  show_visual_marker=False,
@@ -68,7 +68,7 @@ class ObstacleAvoidanceEnv(gym.Env):
         self.stack_frames = 4
 
         # Soft proximity penalty threshold (metres)
-        self.prox_threshold = 5.0
+        self.prox_threshold = 2.5
 
         # Connect to AirSim.
         # When running from WSL2, set AIRSIM_HOST to the Windows host IP
@@ -128,7 +128,6 @@ class ObstacleAvoidanceEnv(gym.Env):
         self.frame_stack = np.zeros(
             (self.stack_frames, self.img_height, self.img_width), dtype=np.uint8
         )
-        self.prev_action = np.zeros(1, dtype=np.float32)
         self.current_step = 0
         self.episode_reward = 0.0
         self.collision_count = 0
@@ -149,16 +148,16 @@ class ObstacleAvoidanceEnv(gym.Env):
         Dense forests are compact; sparse forests cover a wider area.
         """
         ALL_DENSITY_CONFIGS = [
-            ('sparse', 15.0),
-            ('medium', 10.0),
-            ('dense',   6.0),
+            ('sparse', 8.0),
+            ('medium', 6.5),
+            ('dense',   5.0),
         ]
         active_configs = ALL_DENSITY_CONFIGS[:self.density_stage + 1]
         label, min_dist = random.choice(active_configs)
 
         n_trees = len(self.tree_names)
-        DRONE_CLEARANCE = 8.0   # min distance from drone spawn at (0, 0)
-        GOAL_CLEARANCE  = 8.0   # min distance from goal position
+        DRONE_CLEARANCE = 4.0   # min distance from drone spawn at (0, 0)
+        GOAL_CLEARANCE  = 4.0   # min distance from goal position
 
         # Base ellipse with drone start and goal as focal points.
         goal_distance = math.sqrt(goal_x ** 2 + goal_y ** 2)
@@ -211,10 +210,19 @@ class ObstacleAvoidanceEnv(gym.Env):
                 # Rejection sampling exhausted — overlap remaining trees with last placed
                 # (extremely rare with properly scaled ellipse)
                 x, y = placed[-1] if placed else (cx, cy)
+
+            # Random yaw rotation around vertical axis
+            yaw = random.uniform(0, 2 * math.pi)
             pose = airsim.Pose(
                 airsim.Vector3r(x, y, self.ground_z),
-                airsim.Quaternionr(0, 0, 0, 1)
+                airsim.Quaternionr(0, 0, math.sin(yaw / 2), math.cos(yaw / 2))
             )
+
+            # Random scale: xy between 0.7–1.3, z between 1.0–1.5
+            scale_xy = random.uniform(0.7, 1.3)
+            scale_z = random.uniform(1.0, 1.5)
+            self.client.simSetObjectScale(name, airsim.Vector3r(scale_xy, scale_xy, scale_z))
+
             if self.client.simSetObjectPose(name, pose, teleport=True):
                 ok += 1
             else:
@@ -304,7 +312,7 @@ class ObstacleAvoidanceEnv(gym.Env):
         self.current_step = 0
         self.episode_reward = 0.0
         self.collision_count = 0
-        self.prev_action = np.zeros(1, dtype=np.float32)
+        self.lateral_history = []
 
         # Fill the frame stack with the first captured frame (no motion yet,
         # but already facing the goal after rotateToYaw above)
@@ -318,10 +326,7 @@ class ObstacleAvoidanceEnv(gym.Env):
         t_step_start = time.perf_counter()
         self.current_step += 1
 
-        # Action smoothing: 50% blend with previous action.
-        # Prevents abrupt velocity reversals and stabilises AirSim physics.
-        action = 0.5 * np.array(action, dtype=np.float32) + 0.5 * self.prev_action
-        self.prev_action = action.copy()
+        action = np.array(action, dtype=np.float32)
 
         t0 = time.perf_counter()
         position = self._get_position()
@@ -336,6 +341,7 @@ class ObstacleAvoidanceEnv(gym.Env):
 
         # RL correction mapped to world frame (lateral only)
         lateral = float(action[0]) * self.lateral_scale
+        self.lateral_history.append(float(action[0]))
 
         # Combined velocity: forward toward goal + lateral perpendicular
         vel_x = self.episode_speed * ux + lateral * px
@@ -415,10 +421,10 @@ class ObstacleAvoidanceEnv(gym.Env):
         reward = 0.0
 
         if goal_reached:
-            reward += 10.0
+            reward += 100.0
 
         if collision:
-            reward -= 10.0
+            reward -= 100.0
 
         # Soft proximity penalty: centre 50% of depth image.
         # Clamp to [0, prox_threshold] first — anything beyond the threshold
@@ -432,9 +438,12 @@ class ObstacleAvoidanceEnv(gym.Env):
         min_depth_center = float(np.min(center_depth))
         if min_depth_center < self.prox_threshold:
             reward -= (self.prox_threshold - min_depth_center) / self.prox_threshold * 2.0
+        else:
+            # Clear path ahead — reward going straight (up to +0.05/step)
+            reward += (1.0 - abs(float(action[0]))) * 0.05
 
-        # Action norm penalty on the smoothed action
-        reward -= float(np.linalg.norm(action)) * 0.05
+        # Action norm penalty — penalise unnecessary lateral movement
+        reward -= float(np.linalg.norm(action)) * 0.1
 
         self.episode_reward += reward
 
@@ -444,16 +453,26 @@ class ObstacleAvoidanceEnv(gym.Env):
 
         if terminated or truncated:
             reason = "GOAL" if goal_reached else ("COLLISION" if collision else "MAX STEPS")
+            lat = np.array(self.lateral_history)
+            avg_lat = float(np.mean(lat)) if len(lat) > 0 else 0.0
+            avg_abs_lat = float(np.mean(np.abs(lat))) if len(lat) > 0 else 0.0
             print(f"Episode ended ({reason}) | Reward: {self.episode_reward:.2f} | "
                   f"Steps: {self.current_step} | Distance: {new_distance:.1f}m | "
-                  f"Collisions: {self.collision_count}")
+                  f"Collisions: {self.collision_count} | "
+                  f"Lateral avg={avg_lat:+.3f} abs={avg_abs_lat:.3f}")
 
-        return self.frame_stack.copy(), reward, terminated, truncated, {
+        info = {
             'goal_reached': goal_reached,
             'collision': collision,
             'distance': new_distance,
             'collision_count': self.collision_count
         }
+        if terminated or truncated:
+            lat = np.array(self.lateral_history)
+            info['avg_lateral'] = float(np.mean(lat)) if len(lat) > 0 else 0.0
+            info['avg_abs_lateral'] = float(np.mean(np.abs(lat))) if len(lat) > 0 else 0.0
+
+        return self.frame_stack.copy(), reward, terminated, truncated, info
 
     def _get_images(self):
         """Get grayscale frame (observation) and depth (penalty).

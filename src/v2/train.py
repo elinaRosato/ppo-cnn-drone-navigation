@@ -177,6 +177,9 @@ class SuccessRateCallback(BaseCallback):
         self.outcomes = []  # rolling window: 1 = success, 0 = failure
         self.avg_laterals = []
         self.avg_abs_laterals = []
+        self.ep_proximity_rewards = []
+        self.ep_straight_bonuses = []
+        self.ep_action_norm_penalties = []
 
     def _on_step(self) -> bool:
         dones = self.locals.get('dones', [])
@@ -193,6 +196,14 @@ class SuccessRateCallback(BaseCallback):
                     if len(self.avg_laterals) > self.window:
                         self.avg_laterals.pop(0)
                         self.avg_abs_laterals.pop(0)
+                if 'ep_proximity_reward' in info:
+                    self.ep_proximity_rewards.append(info['ep_proximity_reward'])
+                    self.ep_straight_bonuses.append(info['ep_straight_bonus'])
+                    self.ep_action_norm_penalties.append(info['ep_action_norm_penalty'])
+                    if len(self.ep_proximity_rewards) > self.window:
+                        self.ep_proximity_rewards.pop(0)
+                        self.ep_straight_bonuses.pop(0)
+                        self.ep_action_norm_penalties.pop(0)
 
                 if self.episode_count % self.window == 0:
                     success_rate = sum(self.outcomes) / len(self.outcomes)
@@ -201,6 +212,10 @@ class SuccessRateCallback(BaseCallback):
                     if self.avg_laterals:
                         self.logger.record('rollout/lateral_avg', sum(self.avg_laterals) / len(self.avg_laterals))
                         self.logger.record('rollout/lateral_abs_avg', sum(self.avg_abs_laterals) / len(self.avg_abs_laterals))
+                    if self.ep_proximity_rewards:
+                        self.logger.record('reward/proximity', sum(self.ep_proximity_rewards) / len(self.ep_proximity_rewards))
+                        self.logger.record('reward/straight_bonus', sum(self.ep_straight_bonuses) / len(self.ep_straight_bonuses))
+                        self.logger.record('reward/action_norm', sum(self.ep_action_norm_penalties) / len(self.ep_action_norm_penalties))
         return True
 
 from avoidance_env import ObstacleAvoidanceEnv

@@ -313,6 +313,9 @@ class ObstacleAvoidanceEnv(gym.Env):
         self.episode_reward = 0.0
         self.collision_count = 0
         self.lateral_history = []
+        self._ep_proximity_reward = 0.0
+        self._ep_straight_bonus = 0.0
+        self._ep_action_norm_penalty = 0.0
 
         # Fill the frame stack with the first captured frame (no motion yet,
         # but already facing the goal after rotateToYaw above)
@@ -437,13 +440,17 @@ class ObstacleAvoidanceEnv(gym.Env):
         center_depth = np.clip(center_depth, 0.0, self.prox_threshold)
         min_depth_center = float(np.min(center_depth))
         if min_depth_center < self.prox_threshold:
-            reward -= (self.prox_threshold - min_depth_center) / self.prox_threshold * 2.0
+            prox_r = -((self.prox_threshold - min_depth_center) / self.prox_threshold * 2.0)
+            reward += prox_r
+            self._ep_proximity_reward += prox_r
         else:
-            # Clear path ahead — reward going straight (up to +0.05/step)
-            reward += (1.0 - abs(float(action[0]))) * 0.05
+            straight_r = (1.0 - abs(float(action[0]))) * 0.05
+            reward += straight_r
+            self._ep_straight_bonus += straight_r
 
-        # Action norm penalty — penalise unnecessary lateral movement
-        reward -= float(np.linalg.norm(action)) * 0.1
+        action_norm_r = -(float(np.linalg.norm(action)) * 0.1)
+        reward += action_norm_r
+        self._ep_action_norm_penalty += action_norm_r
 
         self.episode_reward += reward
 
@@ -459,7 +466,10 @@ class ObstacleAvoidanceEnv(gym.Env):
             print(f"Episode ended ({reason}) | Reward: {self.episode_reward:.2f} | "
                   f"Steps: {self.current_step} | Distance: {new_distance:.1f}m | "
                   f"Collisions: {self.collision_count} | "
-                  f"Lateral avg={avg_lat:+.3f} abs={avg_abs_lat:.3f}")
+                  f"Lateral avg={avg_lat:+.3f} abs={avg_abs_lat:.3f} | "
+                  f"prox={self._ep_proximity_reward:.1f} "
+                  f"straight={self._ep_straight_bonus:.1f} "
+                  f"norm={self._ep_action_norm_penalty:.1f}")
 
         info = {
             'goal_reached': goal_reached,
@@ -471,6 +481,9 @@ class ObstacleAvoidanceEnv(gym.Env):
             lat = np.array(self.lateral_history)
             info['avg_lateral'] = float(np.mean(lat)) if len(lat) > 0 else 0.0
             info['avg_abs_lateral'] = float(np.mean(np.abs(lat))) if len(lat) > 0 else 0.0
+            info['ep_proximity_reward'] = self._ep_proximity_reward
+            info['ep_straight_bonus'] = self._ep_straight_bonus
+            info['ep_action_norm_penalty'] = self._ep_action_norm_penalty
 
         return self.frame_stack.copy(), reward, terminated, truncated, info
 

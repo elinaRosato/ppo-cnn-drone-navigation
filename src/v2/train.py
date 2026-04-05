@@ -170,13 +170,15 @@ class SuccessRateCallback(BaseCallback):
     Logs every `window` completed episodes.
     """
 
-    def __init__(self, window=50, verbose=0):
+    def __init__(self, success_window=50, verbose=0):
         super().__init__(verbose)
-        self.window = window
+        self.success_window = success_window
         self.episode_count = 0
-        self.outcomes = []  # rolling window: 1 = success, 0 = failure
+        # Rolling windows (never clear — smoothed over last N episodes)
+        self.outcomes = []
         self.avg_laterals = []
         self.avg_abs_laterals = []
+        # Per-rollout accumulators (clear each rollout)
         self.ep_proximity_rewards = []
         self.ep_straight_bonuses = []
         self.ep_action_norm_penalties = []
@@ -188,35 +190,37 @@ class SuccessRateCallback(BaseCallback):
             if done:
                 self.episode_count += 1
                 self.outcomes.append(1 if info.get('goal_reached', False) else 0)
-                if len(self.outcomes) > self.window:
+                if len(self.outcomes) > self.success_window:
                     self.outcomes.pop(0)
                 if 'avg_lateral' in info:
                     self.avg_laterals.append(info['avg_lateral'])
                     self.avg_abs_laterals.append(info['avg_abs_lateral'])
-                    if len(self.avg_laterals) > self.window:
+                    if len(self.avg_laterals) > self.success_window:
                         self.avg_laterals.pop(0)
                         self.avg_abs_laterals.pop(0)
                 if 'ep_proximity_reward' in info:
                     self.ep_proximity_rewards.append(info['ep_proximity_reward'])
                     self.ep_straight_bonuses.append(info['ep_straight_bonus'])
                     self.ep_action_norm_penalties.append(info['ep_action_norm_penalty'])
-                    if len(self.ep_proximity_rewards) > self.window:
-                        self.ep_proximity_rewards.pop(0)
-                        self.ep_straight_bonuses.pop(0)
-                        self.ep_action_norm_penalties.pop(0)
-
-                if self.episode_count % self.window == 0:
-                    success_rate = sum(self.outcomes) / len(self.outcomes)
-                    self.logger.record('rollout/success_rate', success_rate)
-                    self.logger.record('rollout/episodes', self.episode_count)
-                    if self.avg_laterals:
-                        self.logger.record('rollout/lateral_avg', sum(self.avg_laterals) / len(self.avg_laterals))
-                        self.logger.record('rollout/lateral_abs_avg', sum(self.avg_abs_laterals) / len(self.avg_abs_laterals))
-                    if self.ep_proximity_rewards:
-                        self.logger.record('reward/proximity', sum(self.ep_proximity_rewards) / len(self.ep_proximity_rewards))
-                        self.logger.record('reward/straight_bonus', sum(self.ep_straight_bonuses) / len(self.ep_straight_bonuses))
-                        self.logger.record('reward/action_norm', sum(self.ep_action_norm_penalties) / len(self.ep_action_norm_penalties))
         return True
+
+    def _on_rollout_end(self) -> None:
+        if not self.outcomes:
+            return
+        # Success rate and lateral: smoothed rolling window
+        self.logger.record('rollout/success_rate', sum(self.outcomes) / len(self.outcomes))
+        self.logger.record('rollout/episodes', self.episode_count)
+        if self.avg_laterals:
+            self.logger.record('rollout/lateral_avg', sum(self.avg_laterals) / len(self.avg_laterals))
+            self.logger.record('rollout/lateral_abs_avg', sum(self.avg_abs_laterals) / len(self.avg_abs_laterals))
+        # Reward components: per-rollout average then clear
+        if self.ep_proximity_rewards:
+            self.logger.record('reward/proximity', sum(self.ep_proximity_rewards) / len(self.ep_proximity_rewards))
+            self.logger.record('reward/straight_bonus', sum(self.ep_straight_bonuses) / len(self.ep_straight_bonuses))
+            self.logger.record('reward/action_norm', sum(self.ep_action_norm_penalties) / len(self.ep_action_norm_penalties))
+            self.ep_proximity_rewards.clear()
+            self.ep_straight_bonuses.clear()
+            self.ep_action_norm_penalties.clear()
 
 from avoidance_env import ObstacleAvoidanceEnv
 
@@ -362,7 +366,7 @@ def train(resume=False, target_steps=None, use_ros2=False, density_stage=0):
         save_path=os.path.join(run_dir, "checkpoints"),
         name_prefix="simplified_avoidance"
     )
-    success_callback = SuccessRateCallback(window=50)
+    success_callback = SuccessRateCallback(success_window=50)
     validation_callback = ValidationCallback(val_episodes=30, val_every_n_steps=70_000,
                                              density_threshold=0.80)
 

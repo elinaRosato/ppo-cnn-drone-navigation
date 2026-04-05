@@ -59,6 +59,8 @@ see goal-relative information.
 | `fly_mission.py` | Fly a multi-waypoint mission with a trained model |
 | `fly_baseline.py` | Controller-only baseline (no RL) for comparison |
 | `view_camera.py` | Debug tool — display live camera feed identical to what the model sees |
+| `tune.py` | Bayesian hyperparameter optimisation using Optuna — finds the best PPO config for a given density stage |
+| `test_density.py` | Visual tool — place trees at a chosen density to inspect spacing before training |
 | `monitor_drones.py` | Runtime telemetry monitor |
 | `settings_sample.json` | AirSim `settings.json` template |
 | `AIRSIM_ROS2_BRIDGE_SETUP.md` | Step-by-step ROS2 bridge setup guide |
@@ -364,6 +366,37 @@ python3 src/v2/view_camera.py --ros2
 python3 src/v2/view_camera.py --ros2 --stack   # show all 4 stacked frames
 ```
 
+### Hyperparameter Tuning
+
+Run Bayesian hyperparameter search with Optuna before committing to a full
+training run. Each trial trains for `--trial-steps` steps and is evaluated
+by validation success rate. Bad trials are pruned early to save compute.
+Results persist in a SQLite database so the sweep can be stopped and resumed.
+
+```bash
+# 30 trials at stage 0 (sparse forest), 200k steps each (~2-3 hrs/trial)
+python3 src/v2/tune.py --trials 30 --ros2
+
+# Resume an existing sweep (adds more trials on top)
+python3 src/v2/tune.py --trials 20 --ros2
+
+# Show best config found so far without running new trials
+python3 src/v2/tune.py --show-best
+
+# Tune at stage 1 starting from a good stage-0 checkpoint
+python3 src/v2/tune.py --trials 20 --stage 1 \
+    --checkpoint models_v2/run_<timestamp>/checkpoints/best.zip --ros2
+```
+
+**Tuned hyperparameters:** `learning_rate`, `clip_range`, `n_epochs`,
+`gae_lambda`, `vf_coef`, `target_kl`, `ent_coef`, `log_std_init`,
+`n_steps`, `batch_size`, `gamma`, `max_grad_norm`.
+
+Best params are saved to `best_params_stage0.json`. After tuning, update
+`train.py` with the best values and run a full training.
+
+---
+
 ### With ROS2 Bridge (recommended for training)
 
 **Terminal 1 — Unreal Engine:** Open your environment and hit Play.
@@ -399,14 +432,24 @@ Then open `http://localhost:6006` in your browser.
 |--------|-------------|
 | `ep_rew_mean` | Average episode reward — main signal, should trend upward |
 | `ep_len_mean` | Average episode length |
-| `success_rate` | Rolling success rate over the last 50 training episodes |
+| `success_rate` | Rolling success rate over last 50 training episodes |
 | `episodes` | Total training episodes completed |
+| `lateral_avg` | Rolling mean signed lateral correction (bias indicator, should be near 0) |
+| `lateral_abs_avg` | Rolling mean absolute lateral correction (how much the model steers) |
 
 **validation/**
 | Metric | Description |
 |--------|-------------|
-| `success_rate` | Deterministic success rate over 10 episodes, logged every 100 training episodes |
-| `episodes_trained` | Training episodes elapsed when validation ran |
+| `success_rate` | Deterministic success rate over 30 episodes, logged every 70k steps |
+| `lateral_avg` | Mean signed lateral correction during deterministic validation |
+| `lateral_abs_avg` | Mean absolute lateral correction during deterministic validation |
+
+**reward/**
+| Metric | Description |
+|--------|-------------|
+| `proximity` | Rolling mean per-episode proximity penalty (negative — should not dominate) |
+| `straight_bonus` | Rolling mean per-episode straight-path bonus (positive) |
+| `action_norm` | Rolling mean per-episode action norm penalty (negative) |
 
 **train/**
 | Metric | Description |
@@ -414,9 +457,15 @@ Then open `http://localhost:6006` in your browser.
 | `policy_gradient_loss` | How much the policy changes each update |
 | `value_loss` | How well the critic estimates future rewards |
 | `entropy_loss` | Exploration level |
-| `approx_kl` | Policy drift per update |
+| `approx_kl` | Policy drift per update — spikes signal unstable updates |
 | `clip_fraction` | Fraction of updates hitting the PPO clip boundary |
 | `explained_variance` | Critic quality — closer to 1.0 is better |
+| `std` | Action distribution standard deviation — should stay ≤ 1.0 with BoundedStdCnnPolicy |
+
+**curriculum/**
+| Metric | Description |
+|--------|-------------|
+| `density_stage` | Current forest density stage (0=sparse, 1=sparse+medium, 2=all) |
 
 `rollout/success_rate` tracks stochastic training episodes (includes exploration noise).
 `validation/success_rate` uses `deterministic=True` and is the better indicator of true

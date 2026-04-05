@@ -217,6 +217,8 @@ def make_objective(trial_steps, density_stage, checkpoint_path, use_ros2):
             env.close()
             if ros2_bridge is not None:
                 ros2_bridge.stop()
+            del model
+            torch.cuda.empty_cache()
 
         print(f"  Trial {trial.number} final score: {score:.3f}")
         return score
@@ -290,6 +292,7 @@ def main():
         use_ros2=args.ros2,
     )
 
+    input("Make sure AirSim is running, then press ENTER to start tuning...\n")
     study.optimize(objective, n_trials=args.trials, show_progress_bar=True)
 
     # ── Results ───────────────────────────────────────────────────────────────

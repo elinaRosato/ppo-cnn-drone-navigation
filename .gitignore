@@ -22,6 +22,10 @@ logs_v1/
 models_v2/
 logs_v2/
 
+# Hyperparameter tuning outputs
+*.db
+best_params_stage*.json
+
 # IDE
 .vscode/
 .idea/

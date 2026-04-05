@@ -584,5 +584,6 @@ class ObstacleAvoidanceEnv(gym.Env):
         return np.array([pos.x_val, pos.y_val, pos.z_val], dtype=np.float32)
 
     def close(self):
+        self.client.simFlushPersistentMarkers()
         self.client.armDisarm(False)
         self.client.enableApiControl(False)

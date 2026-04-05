@@ -440,7 +440,7 @@ class ObstacleAvoidanceEnv(gym.Env):
         center_depth = np.clip(center_depth, 0.0, self.prox_threshold)
         min_depth_center = float(np.min(center_depth))
         if min_depth_center < self.prox_threshold:
-            prox_r = -((self.prox_threshold - min_depth_center) / self.prox_threshold * 2.0)
+            prox_r = -((self.prox_threshold - min_depth_center) / self.prox_threshold * 0.5)
             reward += prox_r
             self._ep_proximity_reward += prox_r
         else:

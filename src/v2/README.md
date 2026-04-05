@@ -284,7 +284,7 @@ The model adds corrections perpendicular to the goal direction.
 | `goal_distance_range` | (50, 50) | Goal distance from origin in metres |
 | `goal_radius` | 5.0 m | Distance to consider goal reached |
 | `max_steps` | 2000 | Steps before episode truncation |
-| `prox_threshold` | 2.5 m | Depth distance that triggers proximity penalty |
+| `prox_threshold` | 3.5 m | Depth distance that triggers proximity penalty |
 | `stack_frames` | 4 | Number of consecutive frames stacked as observation |
 | `action_momentum` | 0.5 | Blend ratio with previous action (smoothing) |
 

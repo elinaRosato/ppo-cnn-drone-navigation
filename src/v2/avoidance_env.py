@@ -68,7 +68,7 @@ class ObstacleAvoidanceEnv(gym.Env):
         self.stack_frames = 4
 
         # Soft proximity penalty threshold (metres)
-        self.prox_threshold = 2.5
+        self.prox_threshold = 3.5
 
         # Connect to AirSim.
         # When running from WSL2, set AIRSIM_HOST to the Windows host IP

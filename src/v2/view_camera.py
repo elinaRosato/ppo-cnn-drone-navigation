@@ -5,7 +5,7 @@ Subscribes to the same ROS2 topics as the training script and applies the
 identical preprocessing pipeline (BGR→grayscale, resize to 128×128 with
 INTER_AREA) so the display matches exactly what the model receives.
 
-Depth view (--depth): clips to [0, prox_threshold=2.5 m] and renders with
+Depth view (--depth): clips to [0, prox_threshold=3.5 m] and renders with
 COLORMAP_HOT (black=far/safe, white=very close/dangerous). The white
 rectangle marks the centre-50% region used by avoidance_env.py for both
 the proximity penalty and the clear-path bonus. Min depth and the resulting
@@ -34,7 +34,7 @@ from cv_bridge import CvBridge
 STACK_FRAMES = 4
 IMG_SIZE = 128
 DISPLAY_SIZE = 400       # upscale for visibility
-PROX_THRESHOLD = 2.5     # metres — must match avoidance_env.py
+PROX_THRESHOLD = 3.5     # metres — must match avoidance_env.py
 
 
 class CameraReceiver(Node):
@@ -149,8 +149,8 @@ def main(fps: int, show_stack: bool, show_depth: bool,
                      DISPLAY_SIZE, DISPLAY_SIZE)
 
     if show_depth:
-        cv2.namedWindow("Depth — 0–2.5 m clipped (reward signal)", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Depth — 0–2.5 m clipped (reward signal)",
+        cv2.namedWindow("Depth — 0–3.5 m clipped (reward signal)", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Depth — 0–3.5 m clipped (reward signal)",
                          DISPLAY_SIZE, DISPLAY_SIZE)
 
     print(f"Waiting for frames on {scene_topic} ... Press Q to quit.")
@@ -176,7 +176,7 @@ def main(fps: int, show_stack: bool, show_depth: bool,
                     )
 
             if show_depth and depth is not None:
-                cv2.imshow("Depth — 0–2.5 m clipped (reward signal)",
+                cv2.imshow("Depth — 0–3.5 m clipped (reward signal)",
                            render_depth(depth, DISPLAY_SIZE))
 
             if cv2.waitKey(wait_ms) & 0xFF == ord('q'):

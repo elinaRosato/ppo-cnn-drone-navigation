@@ -60,13 +60,6 @@ class ValidationCallback(BaseCallback):
     (sparse only → sparse+medium → all densities). Stage is stored on the
     ObstacleAvoidanceEnv as density_stage and updated via VecEnv.set_attr().
 
-    Adaptive entropy: ent_coef adjusts based on whether validation improved or
-    declined compared to the previous validation:
-      - Improved → decay by entropy_decay_rate (exploit more)
-      - Declined → raise by entropy_rise_rate (explore more)
-    Capped at entropy_max and floored at entropy_min. On curriculum stage
-    advance, ent_coef resets to entropy_max to explore the new environment.
-
     Validation uses the same training environment and therefore the same
     density_stage that is active during training — no separate eval env needed.
     The stage is only advanced *after* all val episodes finish, so all val
@@ -77,20 +70,13 @@ class ValidationCallback(BaseCallback):
 
     def __init__(self, val_episodes=30, val_every_n_steps=70_000,
                  density_threshold=0.80,
-                 entropy_decay_rate=0.85, entropy_rise_rate=1.20,
-                 entropy_min=0.01, entropy_max=0.05,
                  verbose=0):
         super().__init__(verbose)
         self.val_episodes = val_episodes
         self.val_every_n_steps = val_every_n_steps
         self.density_threshold = density_threshold
-        self.entropy_decay_rate = entropy_decay_rate
-        self.entropy_rise_rate = entropy_rise_rate
-        self.entropy_min = entropy_min
-        self.entropy_max = entropy_max
         self.last_val_step = 0
         self._passes_in_a_row = 0
-        self._prev_val_success = None
 
     def _on_step(self) -> bool:
         return True
@@ -143,21 +129,6 @@ class ValidationCallback(BaseCallback):
 
         print(f"[Validation] Success rate: {val_success_rate:.0%} "
               f"({successes}/{self.val_episodes})")
-
-        # Adaptive entropy: decay if validation improved, raise if it declined
-        if self._prev_val_success is None:
-            new_ent_coef = self.model.ent_coef
-            direction = "→ (first validation, no change)"
-        elif val_success_rate >= self._prev_val_success:
-            new_ent_coef = max(self.model.ent_coef * self.entropy_decay_rate, self.entropy_min)
-            direction = f"↓ (improved {self._prev_val_success:.0%} → {val_success_rate:.0%})"
-        else:
-            new_ent_coef = min(self.model.ent_coef * self.entropy_rise_rate, self.entropy_max)
-            direction = f"↑ (declined {self._prev_val_success:.0%} → {val_success_rate:.0%})"
-        self._prev_val_success = val_success_rate
-        self.model.ent_coef = new_ent_coef
-        self.logger.record('train/ent_coef', new_ent_coef)
-        print(f"[Entropy] ent_coef → {new_ent_coef:.4f}  {direction}")
 
         # Curriculum: advance density stage after 2 consecutive passes above threshold
         if current_stage < 2:
@@ -363,7 +334,7 @@ def train(resume=False, target_steps=None, use_ros2=False, density_stage=0):
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            ent_coef=0.05,
+            ent_coef=0.01,
             vf_coef=0.5,
             max_grad_norm=0.5,
             verbose=1,

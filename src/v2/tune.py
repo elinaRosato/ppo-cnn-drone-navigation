@@ -115,17 +115,25 @@ class TuningValidationCallback(BaseCallback):
 
 # ── Objective function ────────────────────────────────────────────────────────
 
-def make_objective(trial_steps, density_stage, checkpoint_path, use_ros2):
+def make_objective(trial_steps, val_interval, density_stage, checkpoint_path, use_ros2):
     def objective(trial):
         # ── Sample hyperparameters ────────────────────────────────────────────
-        lr          = trial.suggest_float("learning_rate", 1e-5, 5e-4, log=True)
-        clip_range  = trial.suggest_categorical("clip_range", [0.1, 0.15, 0.2, 0.25])
-        n_epochs    = trial.suggest_int("n_epochs", 3, 10)
-        gae_lambda  = trial.suggest_float("gae_lambda", 0.90, 0.99)
-        vf_coef     = trial.suggest_float("vf_coef", 0.3, 1.0)
-        target_kl   = trial.suggest_float("target_kl", 0.005, 0.05, log=True)
-        ent_coef    = trial.suggest_float("ent_coef", 0.001, 0.05, log=True)
+        lr           = trial.suggest_float("learning_rate", 1e-5, 5e-4, log=True)
+        clip_range   = trial.suggest_categorical("clip_range", [0.1, 0.15, 0.2, 0.25])
+        n_epochs     = trial.suggest_int("n_epochs", 3, 10)
+        gae_lambda   = trial.suggest_float("gae_lambda", 0.90, 0.99)
+        vf_coef      = trial.suggest_float("vf_coef", 0.3, 1.0)
+        target_kl    = trial.suggest_float("target_kl", 0.005, 0.05, log=True)
+        ent_coef     = trial.suggest_float("ent_coef", 0.001, 0.05, log=True)
         log_std_init = trial.suggest_float("log_std_init", -2.0, 0.0)
+        gamma        = trial.suggest_float("gamma", 0.97, 0.999)
+        max_grad_norm = trial.suggest_float("max_grad_norm", 0.3, 1.0)
+        # n_steps must be a multiple of batch_size — pick n_steps first,
+        # then choose batch_size from valid divisors within a sensible range.
+        n_steps      = trial.suggest_categorical("n_steps", [1024, 2048, 4096])
+        batch_size   = trial.suggest_categorical("batch_size", [64, 128, 256, 512])
+        # Ensure batch_size never exceeds n_steps (SB3 requirement)
+        batch_size   = min(batch_size, n_steps)
 
         print(f"\n{'='*60}")
         print(f"Trial {trial.number} hyperparameters:")
@@ -178,15 +186,15 @@ def make_objective(trial_steps, density_stage, checkpoint_path, use_ros2):
                     BoundedStdCnnPolicy,
                     env,
                     learning_rate=lr,
-                    n_steps=2048,
-                    batch_size=256,
+                    n_steps=n_steps,
+                    batch_size=batch_size,
                     n_epochs=n_epochs,
-                    gamma=0.99,
+                    gamma=gamma,
                     gae_lambda=gae_lambda,
                     clip_range=clip_range,
                     ent_coef=ent_coef,
                     vf_coef=vf_coef,
-                    max_grad_norm=0.5,
+                    max_grad_norm=max_grad_norm,
                     target_kl=target_kl,
                     policy_kwargs={"log_std_init": log_std_init},
                     verbose=0,
@@ -196,7 +204,7 @@ def make_objective(trial_steps, density_stage, checkpoint_path, use_ros2):
             val_callback = TuningValidationCallback(
                 trial=trial,
                 val_episodes=20,
-                val_every_n_steps=70_000,
+                val_every_n_steps=val_interval,
             )
 
             model.learn(
@@ -232,8 +240,10 @@ def main():
     parser = argparse.ArgumentParser(description='Hyperparameter tuning for PPO drone avoidance')
     parser.add_argument('--trials', type=int, default=30,
                         help='Number of Optuna trials (default: 30)')
-    parser.add_argument('--trial-steps', type=int, default=300_000,
-                        help='Training steps per trial (default: 300000)')
+    parser.add_argument('--trial-steps', type=int, default=200_000,
+                        help='Training steps per trial (default: 200000)')
+    parser.add_argument('--val-interval', type=int, default=50_000,
+                        help='Validation interval in steps per trial (default: 50000)')
     parser.add_argument('--stage', type=int, default=0, choices=[0, 1, 2],
                         help='Density stage to tune at (default: 0 = sparse only)')
     parser.add_argument('--checkpoint', type=str, default=None,
@@ -281,12 +291,14 @@ def main():
     print(f"Stage:        {args.stage} ({stage_names[args.stage]})")
     print(f"Trials:       {args.trials}")
     print(f"Steps/trial:  {args.trial_steps:,}")
+    print(f"Val interval: {args.val_interval:,}")
     if args.checkpoint:
         print(f"Checkpoint:   {args.checkpoint}")
     print()
 
     objective = make_objective(
         trial_steps=args.trial_steps,
+        val_interval=args.val_interval,
         density_stage=args.stage,
         checkpoint_path=args.checkpoint,
         use_ros2=args.ros2,

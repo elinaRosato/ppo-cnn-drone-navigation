@@ -388,6 +388,13 @@ python3 src/v2/tune.py --trials 20 --stage 1 \
     --checkpoint models_v2/run_<timestamp>/checkpoints/best.zip --ros2
 ```
 
+**Monitor progress with Optuna Dashboard:**
+```bash
+optuna-dashboard sqlite:///tune_stage0.db
+```
+Then open `http://localhost:8080` to see trial history, parameter importances,
+and pruned trials — updates live as new trials complete.
+
 **Tuned hyperparameters:** `learning_rate`, `clip_range`, `n_epochs`,
 `gae_lambda`, `vf_coef`, `target_kl`, `ent_coef`, `log_std_init`,
 `n_steps`, `batch_size`, `gamma`, `max_grad_norm`.

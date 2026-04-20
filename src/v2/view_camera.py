@@ -2,8 +2,9 @@
 Live camera feed viewer — shows what the model actually sees during training.
 
 Subscribes to the same ROS2 topics as the training script and applies the
-identical preprocessing pipeline (BGR→grayscale, resize to 128×128 with
-INTER_AREA) so the display matches exactly what the model receives.
+identical preprocessing pipeline (BGR→grayscale, resize to 192×192 with
+INTER_AREA, CLAHE contrast normalisation) so the display matches exactly
+what the model receives.
 
 Depth view (--depth): clips to [0, prox_threshold=3.5 m] and renders with
 COLORMAP_HOT (black=far/safe, white=very close/dangerous). The white
@@ -11,11 +12,16 @@ rectangle marks the centre-50% region used by avoidance_env.py for both
 the proximity penalty and the clear-path bonus. Min depth and the resulting
 reward signal are shown as a text overlay.
 
+Augmentation view (--augment): applies the same random noise, brightness/contrast
+jitter and blur used during training so you can see how distorted the input
+looks to the model.
+
 Usage:
     python view_camera.py
     python view_camera.py --fps 10
     python view_camera.py --stack               # show all 4 stacked frames
     python view_camera.py --depth               # show depth alongside grayscale
+    python view_camera.py --augment             # apply training augmentation
     python view_camera.py --topic /airsim_node/MyDrone/front_center_Scene/image
     python view_camera.py --depth-topic /airsim_node/MyDrone/front_center_DepthPerspective/image
 
@@ -32,9 +38,32 @@ from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 
 STACK_FRAMES = 4
-IMG_SIZE = 128
+IMG_SIZE = 192
 DISPLAY_SIZE = 400       # upscale for visibility
 PROX_THRESHOLD = 3.5     # metres — must match avoidance_env.py
+PROX_WEIGHT = 0.5        # must match avoidance_env.py proximity penalty weight
+
+# CLAHE — identical settings to avoidance_env.py
+_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+
+def augment_frame(gray: np.ndarray) -> np.ndarray:
+    """Apply the same augmentation pipeline as avoidance_env.py._augment_frame.
+
+    Gaussian noise σ∈[0.5, 3.0], brightness/contrast jitter ±20/±15%,
+    30%-chance GaussianBlur k∈{3, 5}. Input and output are uint8.
+    """
+    img = gray.astype(np.float32)
+    sigma = np.random.uniform(0.5, 3.0)
+    img += np.random.normal(0, sigma, img.shape).astype(np.float32)
+    alpha = np.random.uniform(0.85, 1.15)   # contrast
+    beta  = np.random.uniform(-20, 20)       # brightness
+    img = img * alpha + beta
+    img = np.clip(img, 0, 255).astype(np.uint8)
+    if np.random.random() < 0.3:
+        k = np.random.choice([3, 5])
+        img = cv2.GaussianBlur(img, (k, k), 0)
+    return img
 
 
 class CameraReceiver(Node):
@@ -57,6 +86,7 @@ class CameraReceiver(Node):
             cv_img = self._bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
             gray = cv2.cvtColor(cv_img, cv2.COLOR_RGB2GRAY)
             gray = cv2.resize(gray, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
+            gray = _CLAHE.apply(gray)   # match avoidance_env.py preprocessing
             with self._lock:
                 if self._latest_gray is None:
                     self.get_logger().info(
@@ -120,7 +150,7 @@ def render_depth(depth: np.ndarray, display_size: int) -> np.ndarray:
     # Compute the same reward signal as avoidance_env.py
     min_d = float(np.min(clipped[ry1:ry2, rx1:rx2]))
     if min_d < PROX_THRESHOLD:
-        penalty = (PROX_THRESHOLD - min_d) / PROX_THRESHOLD * 2.0
+        penalty = (PROX_THRESHOLD - min_d) / PROX_THRESHOLD * PROX_WEIGHT
         label = f"min={min_d:.2f}m  penalty=-{penalty:.3f}"
         colour = (80, 160, 255)   # orange in BGR
     else:
@@ -133,7 +163,7 @@ def render_depth(depth: np.ndarray, display_size: int) -> np.ndarray:
     return coloured
 
 
-def main(fps: int, show_stack: bool, show_depth: bool,
+def main(fps: int, show_stack: bool, show_depth: bool, augment: bool,
          scene_topic: str, depth_topic: str):
     rclpy.init()
     node = CameraReceiver(scene_topic, depth_topic if show_depth else None)
@@ -144,9 +174,9 @@ def main(fps: int, show_stack: bool, show_depth: bool,
     wait_ms = max(1, int(1000 / fps))
     frame_stack = np.zeros((STACK_FRAMES, IMG_SIZE, IMG_SIZE), dtype=np.uint8)
 
-    cv2.namedWindow("Drone Camera — 128×128 grayscale (model input)", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Drone Camera — 128×128 grayscale (model input)",
-                     DISPLAY_SIZE, DISPLAY_SIZE)
+    scene_win = "Drone Camera — 192×192 grayscale" + (" [AUGMENTED]" if augment else " (model input)")
+    cv2.namedWindow(scene_win, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(scene_win, DISPLAY_SIZE, DISPLAY_SIZE)
 
     if show_depth:
         cv2.namedWindow("Depth — 0–3.5 m clipped (reward signal)", cv2.WINDOW_NORMAL)
@@ -160,8 +190,9 @@ def main(fps: int, show_stack: bool, show_depth: bool,
             gray, depth = node.get_latest()
 
             if gray is not None:
+                display_gray = augment_frame(gray) if augment else gray
                 frame_stack = np.roll(frame_stack, shift=-1, axis=0)
-                frame_stack[-1] = gray
+                frame_stack[-1] = display_gray
 
                 if show_stack:
                     frames = [cv2.resize(frame_stack[i], (200, 200))
@@ -170,8 +201,8 @@ def main(fps: int, show_stack: bool, show_depth: bool,
                                np.concatenate(frames, axis=1))
                 else:
                     cv2.imshow(
-                        "Drone Camera — 128×128 grayscale (model input)",
-                        cv2.resize(gray, (DISPLAY_SIZE, DISPLAY_SIZE),
+                        scene_win,
+                        cv2.resize(display_gray, (DISPLAY_SIZE, DISPLAY_SIZE),
                                    interpolation=cv2.INTER_NEAREST),
                     )
 
@@ -195,6 +226,8 @@ if __name__ == "__main__":
                         help='Show all 4 stacked frames side-by-side')
     parser.add_argument('--depth', action='store_true',
                         help='Show depth camera with penalty region highlighted')
+    parser.add_argument('--augment', action='store_true',
+                        help='Apply training augmentation (noise, jitter, blur)')
     parser.add_argument('--topic', type=str,
                         default='/airsim_node/SimpleFlight/front_center_Scene/image',
                         help='ROS2 scene image topic')
@@ -204,4 +237,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(fps=args.fps, show_stack=args.stack, show_depth=args.depth,
-         scene_topic=args.topic, depth_topic=args.depth_topic)
+         augment=args.augment, scene_topic=args.topic, depth_topic=args.depth_topic)

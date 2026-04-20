@@ -31,14 +31,15 @@ without converging.
 └─────────┬───────────┘
           │
           ▼
-┌─────────────────────┐
-│      train.py       │
-│   PPO + CnnPolicy   │
-│   DummyVecEnv       │
-│   CheckpointCallback│
-│   SuccessRateCallback│
-│   ValidationCallback│
-└─────────────────────┘
+┌─────────────────────────────┐
+│         train.py            │
+│  PPO + AsymmetricAC policy  │
+│  DummyVecEnv + VecNormalize │
+│  CheckpointCallback         │
+│  SuccessRateCallback        │
+│  ValidationCallback         │
+│  launch_training.py         │
+└─────────────────────────────┘
 ```
 
 The key split: **the controller handles navigation, the RL model handles only
@@ -53,13 +54,14 @@ see goal-relative information.
 | File | Purpose |
 |------|---------|
 | `avoidance_env.py` | Gymnasium environment — physics, rewards, frame stack, forest generation |
-| `train.py` | PPO training loop with checkpoint/resume/validation support |
+| `train.py` | PPO training loop with checkpoint/resume/validation/curriculum support |
 | `ros2_bridge.py` | Thread-safe ROS2 image subscriber (optional, high-frequency path) |
+| `launch_training.py` | One-command launcher — waits for AirSim, starts ROS2 node, TensorBoard, then training |
 | `test.py` | Evaluate a trained model over N episodes |
+| `tune.py` | Bayesian hyperparameter optimisation using Optuna |
+| `view_camera.py` | Debug tool — display live camera feed identical to what the model sees |
 | `fly_mission.py` | Fly a multi-waypoint mission with a trained model |
 | `fly_baseline.py` | Controller-only baseline (no RL) for comparison |
-| `view_camera.py` | Debug tool — display live camera feed identical to what the model sees |
-| `tune.py` | Bayesian hyperparameter optimisation using Optuna — finds the best PPO config for a given density stage |
 | `test_density.py` | Visual tool — place trees at a chosen density to inspect spacing before training |
 | `monitor_drones.py` | Runtime telemetry monitor |
 | `settings_sample.json` | AirSim `settings.json` template |
@@ -72,9 +74,9 @@ see goal-relative information.
 ### 1. Separation of Navigation and Avoidance
 
 The RL model does **not** navigate. A deterministic controller computes a
-forward velocity toward the goal every step. The model outputs only two
-corrections: lateral (left/right, perpendicular to the goal direction) and
-vertical (up/down). These are added on top of the controller velocity.
+forward velocity toward the goal every step. The model outputs only a lateral
+correction (left/right, perpendicular to the goal direction). Vertical altitude
+is held by a P-controller and is not part of the action space.
 
 **Why:** Goal-conditioned navigation is a much harder problem that requires
 the model to understand its position relative to the goal. By handing
@@ -82,9 +84,9 @@ navigation to a simple controller, the model can focus entirely on what it
 can actually see in the camera — obstacles. It also makes the policy
 directly reusable on a real drone with any navigation stack.
 
-### 2. RGB Grayscale Instead of Depth as Observation
+### 2. RGB Grayscale Instead of Depth as Actor Observation
 
-The model receives **4 stacked grayscale frames** derived from the RGB camera,
+The actor receives **4 stacked grayscale frames** derived from the RGB camera,
 not the depth image.
 
 **Why:** Depth sensors on real drones (e.g. Intel RealSense) have a very
@@ -92,25 +94,81 @@ different noise profile and range from AirSim's simulated depth. RGB cameras
 are far more consistent between simulation and reality. Using RGB as the
 observation eliminates one major source of the sim-to-real gap.
 
-Depth is still fetched every step but is only used internally for the **soft
-proximity penalty reward** (see below). It is never fed to the model.
+Depth is still fetched every step but is used in two ways:
+- **Proximity penalty reward** — clipped to `prox_threshold = 3.5 m`
+- **Privileged critic observation** — clipped to `critic_depth_range = 15.0 m` (see §6)
 
-### 3. Frame Stacking — (4, 128, 128) CHW
+### 3. CLAHE Contrast Normalisation
+
+After grayscale conversion and resize, each frame passes through CLAHE
+(`clipLimit=2.0, tileGridSize=(8,8)`). This boosts local contrast and makes
+the preprocessing robust to different lighting conditions (time-of-day
+randomisation, indoor vs. outdoor scenes).
+
+### 4. Image Augmentation (Training Only)
+
+During training (`training_mode=True`) each captured frame is randomly
+augmented before being added to the frame stack:
+
+- **Gaussian noise** σ ∈ [0.5, 3.0]
+- **Brightness/contrast jitter** ±20 / ±15%
+- **Gaussian blur** k ∈ {3, 5}, applied with 30% probability
+
+Augmentation is disabled during validation and test. This is a form of domain
+randomisation that prevents the model from overfitting to clean sim textures.
+
+Use `view_camera.py --augment` to visualise the augmented input in real time.
+
+### 5. Frame Stacking — (4, 192, 192) CHW
 
 Four consecutive grayscale frames are stacked along the channel axis,
-producing a `(4, 128, 128)` observation. This gives the CNN temporal context —
+producing a `(4, 192, 192)` observation. This gives the CNN temporal context —
 it can infer whether an obstacle is approaching or receding, and detect motion
 even from a monocular camera.
-
-The observation is already channels-first (CHW). Stable-Baselines3's
-`CnnPolicy` detects this automatically because the first dimension (4) is
-smaller than the spatial dimensions (128), so no `VecTransposeImage` wrapper
-is needed.
 
 **Frame update:** the stack is a rolling window — each step, the oldest frame
 is dropped and the newest is appended at index `[-1]` using `np.roll`.
 
-### 4. Yaw-to-Movement-Direction
+### 6. Asymmetric Actor-Critic
+
+The policy uses an asymmetric design where the actor and critic receive
+different information:
+
+```
+Actor:  image (4,192,192) + state (2,)      → CNN + MLP → 288 features → MLP[64,64] → action
+Critic: same 288 features + privileged (1,) →                            MLP[128,128] → value
+```
+
+**Actor state vector** `[speed_norm, lateral_offset_norm]`:
+- `speed_norm` = episode speed / max speed — helps the model time dodge manoeuvres
+- `lateral_offset_norm` = signed perpendicular drift from the spawn→goal line / goal distance
+
+**Privileged critic observation** `[min_depth_norm]`:
+- Minimum depth in the centre 50% of the frame, clipped to `critic_depth_range = 15.0 m`
+- Normalised to [0, 1]: 0 = obstacle touching, 1 = 15 m+ clear
+- The longer clip range (vs 3.5 m for the penalty) lets the critic anticipate obstacles
+  before they affect the reward, producing better value estimates
+- Only the critic sees this during training; **the deployed actor needs only the RGB camera**
+
+**Why asymmetric:** The critic is only used during training to compute advantages
+(GAE). At deployment only the actor runs, so it is fine to give the critic
+privileged sensor information that would be unavailable or unreliable on a real
+drone.
+
+### 7. Lateral Drift Penalty
+
+A small penalty is applied each step when the drone drifts more than 1 m
+perpendicular to the spawn→goal line:
+
+```
+drift_penalty = -(|lateral_offset| - 1.0) × 0.005   when |offset| > 1 m
+```
+
+**Why:** Without this, the model learns to dodge by strafing far to one side
+and never returning. The penalty encourages it to re-centre after avoidance
+manoeuvres, producing tighter, more efficient trajectories.
+
+### 8. Yaw-to-Movement-Direction
 
 At each step, the drone's yaw is set to face the direction of the combined
 velocity vector (controller forward + model lateral correction), not simply
@@ -121,18 +179,18 @@ At episode reset, `rotateToYawAsync` aligns the drone to face the goal before
 the first frame is captured, so the initial frame stack contains a consistent
 forward view from step 0.
 
-### 5. Speed Randomisation
+### 9. Speed Randomisation
 
 Each episode draws a random cruising speed from `speed_range = (1.0, 3.0) m/s`.
 The controller moves at this speed; the model's corrections are applied on top.
+The normalised speed is included in the state vector so the model can adapt its
+dodge timing to the current episode speed.
 
-**Why:** This is a form of domain randomisation. A model trained at a single
-speed may overfit to the temporal signature of obstacles approaching at that
-exact rate. Randomising speed forces the model to learn appearance-based
-avoidance rather than motion-timing-based avoidance, which transfers better to
-real deployment where wind and payload vary.
+**Why:** A model trained at a single speed may overfit to the temporal signature
+of obstacles approaching at that exact rate. Randomising speed forces the model
+to learn appearance-based avoidance rather than motion-timing-based avoidance.
 
-### 6. Action Smoothing
+### 10. Action Smoothing
 
 The action applied to AirSim is a 50/50 blend of the current model output and
 the previous action:
@@ -142,41 +200,21 @@ action = 0.5 * new_action + 0.5 * prev_action
 ```
 
 **Why:** AirSim's physics engine can become unstable with abrupt velocity
-reversals (e.g. hard left followed immediately by hard right). Smoothing
-prevents oscillation and produces more natural flight trajectories. It also
-acts as implicit regularisation — the model cannot exploit high-frequency
-jitter to rack up large corrections.
+reversals. Smoothing prevents oscillation and produces more natural flight
+trajectories.
 
-### 7. Reward Structure
+### 11. Reward Structure
 
 | Signal | Value | Condition |
 |--------|-------|-----------|
 | Goal reached | +10.0 | Distance to goal < `goal_radius` (5 m) |
-| Collision | -10.0 | AirSim reports `has_collided` |
-| Soft proximity penalty | 0 to -2.0 | Closest obstacle in centre 50% of depth image < `prox_threshold` (5 m) |
-| Action norm penalty | -0.05 × ‖action‖ | Every step |
+| Collision | -100.0 | AirSim reports `has_collided` |
+| Soft proximity penalty | 0 to −0.5 | Min depth in centre 50% < `prox_threshold` (3.5 m) |
+| Clear-path bonus | 0 to +0.05 | Min depth ≥ 3.5 m, scales with how straight the action is |
+| Action norm penalty | −0.1 × ‖action‖ | Every step |
+| Lateral drift penalty | −(‖offset‖ − 1.0) × 0.005 | When lateral offset > 1 m |
 
-**Goal reward:** necessary to distinguish a successful episode from a timeout.
-Without it, the model cannot tell the difference between reaching the goal and
-running out of steps.
-
-**Collision terminates immediately:** the episode ends on first collision
-rather than continuing. This prevents the model from learning to tolerate
-collisions by grinding out small rewards afterward.
-
-**Soft proximity penalty:** gives a smooth gradient signal well before a
-collision occurs. The penalty scales linearly: `0` at `prox_threshold` metres,
-`-2.0` at `0` metres. Only the centre 50% of the depth image is used (the
-quarter-crop on each side), so objects only visible in peripheral vision do not
-dominate. Depth is clamped to `[0, prox_threshold]` before computing the
-minimum, which (a) ignores background objects beyond the threshold, and (b)
-guards against `NaN`/`inf` values that AirSim returns for open sky.
-
-**Action norm penalty:** encourages the model to output small corrections when
-no obstacle is present (i.e. trust the controller). The optimal policy for an
-obstacle-free flight is `[0, 0]`.
-
-### 8. ROS2 Bridge — Closing the Temporal Frequency Gap
+### 12. ROS2 Bridge — Closing the Temporal Frequency Gap
 
 The single largest source of the sim-to-real gap in v1 was **capture
 frequency**. The AirSim Python API `simGetImages()` takes ~500 ms per call
@@ -185,91 +223,90 @@ frequency**. The AirSim Python API `simGetImages()` takes ~500 ms per call
 - Training frequency: ~1.5 Hz → 4 frames span ~2.7 seconds
 - Real deployment (RealSense): 30 Hz → 4 frames span ~133 ms
 
-The model trained at 1.5 Hz learns to react to motion that has already
-finished by the time it executes an action on a real drone at 30 Hz.
-
 `ros2_bridge.py` solves this by subscribing to the AirSim ROS2 bridge topics,
-which publish at the Unreal Engine render rate (~30 Hz). Both the RGB and
-depth streams are subscribed in a single background thread and cached. The
-training loop reads the latest frame from memory (a mutex-protected dict
-lookup, sub-millisecond), so the bottleneck shifts away from image capture
-entirely.
+which publish at the Unreal Engine render rate (~30 Hz). The training loop
+reads the latest frame from memory (sub-millisecond), so the bottleneck shifts
+away from image capture entirely.
 
 ```
 Without ROS2 bridge:
   simGetImages() ≈ 500 ms  →  step ≈ 600 ms  →  ~1.5 Hz
 
 With ROS2 bridge:
-  get_latest_frame() ≈ 0.1 ms  →  step ≈ 10-20 ms  →  ~50-100 Hz (capped by sim tick)
+  get_latest_frame() ≈ 0.1 ms  →  step ≈ 10-20 ms  →  ~50-100 Hz
 ```
 
 The bridge is **optional** — pass `ros2_bridge=None` (default) to fall back to
-the Python API. This preserves compatibility on machines without ROS2.
+the Python API.
 
-**Depth fallback:** if the bridge's depth topic has not yet received a frame
-(or `depth_topic=None`), the environment automatically falls back to a single
-`simGetImages` depth-only API call. Once the topic starts delivering frames,
-the fallback is no longer used.
+### 13. Dynamic Forest Generation
 
-### 9. Dynamic Forest Generation
+Each episode, trees are repositioned into an **ellipse aligned along the goal
+direction**. The ellipse spans the full path length with a ±10 m lateral
+corridor. A density curriculum controls tree spacing:
 
-Each episode, trees are repositioned into an **ellipse aligned along the
-goal direction**. The ellipse spans the full path length (semi-major axis)
-with a ±10 m lateral corridor (semi-minor axis). Tree density is randomly
-selected each episode:
+| Stage | Min spacing | Mix |
+|-------|-------------|-----|
+| 0 | 8.0 m | sparse only |
+| 1 | 6.5 m | sparse + medium |
+| 2 | 5.0 m | all densities |
 
-| Config | Min spacing | Approx trees active |
-|--------|-------------|---------------------|
-| Dense  | 2.0 m       | ~195                |
-| Medium | 3.0 m       | ~87                 |
-| Sparse | 4.0 m       | ~50                 |
+The curriculum advances automatically after two consecutive validation runs
+above 80% success rate.
 
-Trees that don't fit the chosen density are parked 500 m above the scene.
+**Background trees:** approximately 30% of available tree actors are placed
+outside the flight corridor (>5 m lateral clearance) as visual background.
+This makes the scene look more realistic and prevents the model from learning
+to treat a sparse background as a shortcut signal.
 
-Tree actors are discovered at startup using `simListSceneObjects()`, filtered
-by `TREE_ACTOR_FILTER = 'StaticMeshActor_UAID_'`. This matches all manually
-placed static mesh actors while excluding landscape, HLOD, PCG, and system
-actors which use different prefixes.
+Trees that don't fit in the obstacle zone are parked at a remote location.
 
-**Minimum recommended trees:** 200. With fewer trees, dense configurations
-will be limited and the forest may look sparse.
-
-### 10. Environment Randomisation
+### 14. Environment Randomisation
 
 Each episode randomises:
 - **Goal direction** — uniform random angle, fixed distance (50 m)
 - **Episode speed** — uniform draw from `speed_range` (1.0–3.0 m/s)
-- **Forest density** — randomly chosen from dense / medium / sparse
+- **Forest density** — randomly chosen for the current curriculum stage
 - **Sun position** — random time of day between 06:00 and 19:59 via `simSetTimeOfDay`
+
+### 15. VecNormalize Reward Normalisation
+
+Rewards are normalised online using `VecNormalize(norm_obs=False,
+norm_reward=True, gamma=0.99, clip_reward=10.0)`. This stabilises training
+across the large reward range (goal +10 vs. collision −100) without changing
+the reward signal semantics.
+
+The normaliser statistics are saved alongside every checkpoint as
+`vecnormalize_<step>_steps.pkl` and automatically loaded on resume.
 
 ---
 
 ## Observation Space
 
 ```
-Shape:  (4, 128, 128)   — channels-first (CHW)
-dtype:  uint8
-Range:  [0, 255]
-
-Channel 0: oldest grayscale frame  (t - 3)
-Channel 1:                         (t - 2)
-Channel 2:                         (t - 1)
-Channel 3: newest grayscale frame  (t)
+Type:   Dict
+{
+    "image":     (4, 192, 192) uint8   — 4 stacked CLAHE grayscale frames (CHW)
+    "state":     (2,)          float32 — [speed_norm, lateral_offset_norm]
+    "privileged":(1,)          float32 — [min_depth_norm] — critic only
+}
 ```
+
+The actor uses `"image"` and `"state"` only. `"privileged"` is passed to the
+critic during training and is ignored at deployment.
 
 ## Action Space
 
 ```
-Shape:  (2,)
+Shape:  (1,)
 dtype:  float32
 Range:  [-1.0, 1.0]
 
-action[0]: lateral correction  — scaled by lateral_scale (1.0 m/s)
-action[1]: vertical correction — scaled by vertical_scale (1.0 m/s)
+action[0]: lateral correction — scaled by lateral_scale (1.5 m/s)
 ```
 
 The controller always provides full forward velocity toward the goal.
-The model adds corrections perpendicular to the goal direction.
+Vertical altitude is held by a P-controller independently.
 
 ---
 
@@ -280,56 +317,45 @@ The model adds corrections perpendicular to the goal direction.
 | Parameter | Value | Description |
 |-----------|-------|-------------|
 | `speed_range` | (1.0, 3.0) m/s | Randomised forward speed per episode |
-| `lateral_scale` | 1.0 | Max lateral correction velocity (m/s) |
-| `vertical_scale` | 1.0 | Max vertical correction velocity (m/s) |
-| `cruising_altitude` | -1.5 m | Target altitude (NED, negative = up) |
-| `goal_distance_range` | (50, 50) | Goal distance from origin in metres |
+| `lateral_scale` | 1.5 | Max lateral correction velocity (m/s) |
+| `cruising_altitude` | −1.5 m | Target altitude (NED, negative = up) |
+| `goal_distance` | 50 m | Fixed goal distance from spawn |
 | `goal_radius` | 5.0 m | Distance to consider goal reached |
 | `max_steps` | 2000 | Steps before episode truncation |
-| `prox_threshold` | 3.5 m | Depth distance that triggers proximity penalty |
-| `stack_frames` | 4 | Number of consecutive frames stacked as observation |
+| `prox_threshold` | 3.5 m | Depth clip range for proximity penalty |
+| `critic_depth_range` | 15.0 m | Depth clip range for privileged critic obs |
+| `stack_frames` | 4 | Number of consecutive frames stacked |
 | `action_momentum` | 0.5 | Blend ratio with previous action (smoothing) |
+| `bg_tree_fraction` | 0.30 | Fraction of tree actors used as background |
 
-### PPO (Stable-Baselines3)
+### PPO (Stable-Baselines3) — Optuna-tuned
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| `policy` | CnnPolicy | Convolutional policy for image input |
-| `learning_rate` | 1e-4 | Adam optimizer learning rate |
-| `n_steps` | 2048 | Steps per rollout buffer |
-| `batch_size` | 256 | Minibatch size for gradient updates |
-| `n_epochs` | 5 | Passes over rollout data per update |
+| `policy` | AsymmetricActorCriticPolicy | Custom asymmetric actor-critic |
+| `learning_rate` | 1.47e-4 | Adam optimizer learning rate |
+| `n_steps` | 4096 | Steps per rollout buffer |
+| `batch_size` | 512 | Minibatch size for gradient updates |
+| `n_epochs` | 9 | Passes over rollout data per update |
 | `gamma` | 0.99 | Discount factor |
-| `gae_lambda` | 0.95 | GAE lambda for advantage estimation |
+| `gae_lambda` | 0.940 | GAE lambda for advantage estimation |
 | `clip_range` | 0.2 | PPO clipping range |
-| `ent_coef` | 0.01 | Entropy coefficient (exploration) |
-| `vf_coef` | 0.5 | Value function loss coefficient |
-| `max_grad_norm` | 0.5 | Gradient clipping |
+| `ent_coef` | 0.00183 | Entropy coefficient (exploration) |
+| `vf_coef` | 1.0 | Value function loss coefficient |
+| `max_grad_norm` | 0.993 | Gradient clipping |
+| `target_kl` | 0.033 | Early-stop KL threshold per update |
+| `log_std_init` | −0.111 | Initial log std for action distribution |
 
 ### Camera / Observation
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
 | Source | RGB Scene (ImageType 0) | Captured as colour, converted to grayscale |
-| Resolution | 128×128 | Per frame, matches CnnPolicy input |
-| Channels | 4 stacked frames | Observation shape: (4, 128, 128) CHW |
+| Resolution | 192×192 | Per frame, after resize |
+| Channels | 4 stacked frames | Observation shape: (4, 192, 192) CHW |
+| Preprocessing | CLAHE (clipLimit=2.0) | Applied after grayscale conversion |
 | FOV | 120 degrees | Wide angle for obstacle detection |
-| Camera position | X=0.25, Z=-0.1 | Front-center, slightly above body |
-| Depth (reward only) | ImageType 2, raw metres | Used for proximity penalty, not fed to model |
-
----
-
-## Altitude Hold
-
-A P-controller maintains cruising altitude:
-```
-altitude_error = cruising_altitude - current_z
-base_vz = clip(altitude_error * 0.2, -1.0, 1.0)
-body_vz = base_vz + vertical_correction
-```
-
-The model can add vertical corrections on top, but is clamped when already
-above cruising altitude to prevent runaway climbs.
+| Depth (reward + critic) | ImageType 2, raw metres | Not fed to the actor |
 
 ---
 
@@ -342,15 +368,31 @@ source ~/Sites/ppo-cnn-drone-navigation/venv/bin/activate
 cd ~/Sites/ppo-cnn-drone-navigation
 ```
 
+### Recommended: one-command launcher
+
+`launch_training.py` automates all setup steps after you hit Play in UE5:
+waits for AirSim, starts the ROS2 node, waits for the camera topic, starts
+TensorBoard, then starts training.
+
 ```bash
-# Train (new run, 200k steps)
-python3 src/v2/train.py
+# New training run
+python3 src/v2/launch_training.py
 
-# Train with ROS2 bridge (recommended — 30 Hz image capture)
+# Resume from latest checkpoint
+python3 src/v2/launch_training.py --resume
+
+# Custom step count
+python3 src/v2/launch_training.py --steps 1000000
+
+# Hyperparameter tuning
+python3 src/v2/launch_training.py --tune --trials 30
+```
+
+### Manual
+
+```bash
+# Train (new run)
 python3 src/v2/train.py --ros2
-
-# Train for 1M steps
-python3 src/v2/train.py --ros2 --steps 1000000
 
 # Resume from latest checkpoint
 python3 src/v2/train.py --resume --ros2
@@ -362,23 +404,18 @@ python3 src/v2/test.py
 python3 src/v2/test.py --model models_v2/run_<timestamp>/simplified_avoidance_final.zip --episodes 20
 
 # View the live camera feed (same preprocessing as the model sees)
-python3 src/v2/view_camera.py --ros2
-python3 src/v2/view_camera.py --ros2 --stack   # show all 4 stacked frames
+python3 src/v2/view_camera.py
+python3 src/v2/view_camera.py --stack              # show all 4 stacked frames
+python3 src/v2/view_camera.py --depth              # show depth with penalty region
+python3 src/v2/view_camera.py --augment            # show augmented input (training noise/jitter)
+python3 src/v2/view_camera.py --augment --stack    # augmented frame stack
 ```
 
 ### Hyperparameter Tuning
 
-Run Bayesian hyperparameter search with Optuna before committing to a full
-training run. Each trial trains for `--trial-steps` steps and is evaluated
-by validation success rate. Bad trials are pruned early to save compute.
-Results persist in a SQLite database so the sweep can be stopped and resumed.
-
 ```bash
-# 30 trials at stage 0 (sparse forest), 200k steps each (~2-3 hrs/trial)
+# 30 trials at stage 0 (sparse forest), 200k steps each
 python3 src/v2/tune.py --trials 30 --ros2
-
-# Resume an existing sweep (adds more trials on top)
-python3 src/v2/tune.py --trials 20 --ros2
 
 # Show best config found so far without running new trials
 python3 src/v2/tune.py --show-best
@@ -388,23 +425,15 @@ python3 src/v2/tune.py --trials 20 --stage 1 \
     --checkpoint models_v2/run_<timestamp>/checkpoints/best.zip --ros2
 ```
 
-**Monitor progress with Optuna Dashboard:**
+Monitor with Optuna Dashboard:
 ```bash
 optuna-dashboard sqlite:///tune_stage0.db
+# open http://localhost:8080
 ```
-Then open `http://localhost:8080` to see trial history, parameter importances,
-and pruned trials — updates live as new trials complete.
-
-**Tuned hyperparameters:** `learning_rate`, `clip_range`, `n_epochs`,
-`gae_lambda`, `vf_coef`, `target_kl`, `ent_coef`, `log_std_init`,
-`n_steps`, `batch_size`, `gamma`, `max_grad_norm`.
-
-Best params are saved to `best_params_stage0.json`. After tuning, update
-`train.py` with the best values and run a full training.
 
 ---
 
-### With ROS2 Bridge (recommended for training)
+### Manual multi-terminal setup (without launch_training.py)
 
 **Terminal 1 — Unreal Engine:** Open your environment and hit Play.
 
@@ -412,7 +441,7 @@ Best params are saved to `best_params_stage0.json`. After tuning, update
 ```bash
 source /opt/ros/jazzy/setup.bash
 source ~/Cosys-AirSim/ros2/install/setup.bash
-ros2 launch airsim_ros_pkgs airsim_node.launch.py host_ip:=localhost
+ros2 launch airsim_ros_pkgs airsim_node.launch.py host:=localhost
 ```
 
 **Terminal 3 — Training:**
@@ -424,11 +453,9 @@ python3 src/v2/train.py --ros2 --steps 1000000
 
 **Terminal 4 — TensorBoard:**
 ```bash
-source ~/Sites/ppo-cnn-drone-navigation/venv/bin/activate
-tensorboard --logdir logs_v2
+tensorboard --logdir src/v2/logs_v2
+# open http://localhost:6006
 ```
-
-Then open `http://localhost:6006` in your browser.
 
 ---
 
@@ -447,16 +474,17 @@ Then open `http://localhost:6006` in your browser.
 **validation/**
 | Metric | Description |
 |--------|-------------|
-| `success_rate` | Deterministic success rate over 30 episodes, logged every 70k steps |
+| `success_rate` | Deterministic success rate over 30 episodes, logged every ~74k steps |
 | `lateral_avg` | Mean signed lateral correction during deterministic validation |
 | `lateral_abs_avg` | Mean absolute lateral correction during deterministic validation |
 
 **reward/**
 | Metric | Description |
 |--------|-------------|
-| `proximity` | Rolling mean per-episode proximity penalty (negative — should not dominate) |
-| `straight_bonus` | Rolling mean per-episode straight-path bonus (positive) |
+| `proximity` | Rolling mean per-episode proximity penalty (negative) |
+| `straight_bonus` | Rolling mean per-episode clear-path bonus (positive) |
 | `action_norm` | Rolling mean per-episode action norm penalty (negative) |
+| `drift` | Rolling mean per-episode lateral drift penalty (negative, should approach 0) |
 
 **train/**
 | Metric | Description |
@@ -467,7 +495,7 @@ Then open `http://localhost:6006` in your browser.
 | `approx_kl` | Policy drift per update — spikes signal unstable updates |
 | `clip_fraction` | Fraction of updates hitting the PPO clip boundary |
 | `explained_variance` | Critic quality — closer to 1.0 is better |
-| `std` | Action distribution standard deviation — should stay ≤ 1.0 with BoundedStdCnnPolicy |
+| `std` | Action distribution standard deviation |
 
 **curriculum/**
 | Metric | Description |
@@ -488,8 +516,8 @@ Key parameters:
 ```json
 "ClockSpeed": 10.0    // Speed up simulation for faster training
 "ImageType": 0        // Scene (RGB) — used for observations
-"ImageType": 2        // DepthPerspective — used for proximity penalty
-"Width": 256          // Native render resolution (downsampled to 128x128 in code)
+"ImageType": 2        // DepthPerspective — used for proximity penalty and critic
+"Width": 256          // Native render resolution (downsampled to 192×192 in code)
 "Height": 256
 "TargetFPS": 30       // Cap render rate to match ROS2 bridge target frequency
 "FOV_Degrees": 120    // Wide FOV for better peripheral obstacle detection
@@ -502,12 +530,15 @@ Key parameters:
 ```
 models_v2/
   run_YYYY-MM-DD_HH-MM-SS/
-    checkpoints/                    # Saved every 30k steps
-    simplified_avoidance_final.zip  # Final model
+    checkpoints/
+      simplified_avoidance_<N>_steps.zip   # Saved every 30k steps
+      vecnormalize_<N>_steps.pkl           # VecNormalize stats (saved alongside each checkpoint)
+    simplified_avoidance_final.zip         # Final model
+    vecnormalize_final.pkl                 # Final VecNormalize stats
 
 logs_v2/
   run_YYYY-MM-DD_HH-MM-SS/
-    tensorboard/                    # TensorBoard logs
+    tensorboard/                           # TensorBoard logs
 ```
 
 ---

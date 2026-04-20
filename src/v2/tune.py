@@ -29,25 +29,13 @@ import optuna
 from optuna.pruners import MedianPruner
 from optuna.samplers import TPESampler
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.policies import ActorCriticCnnPolicy
 import torch
 
 from avoidance_env import ObstacleAvoidanceEnv
-
-
-# ── Bounded std policy (same as train.py) ────────────────────────────────────
-
-class BoundedStdCnnPolicy(ActorCriticCnnPolicy):
-    _LOG_STD_MAX = 0.0
-    _LOG_STD_MIN = -4.6
-
-    def _get_action_dist_from_latent(self, latent_pi):
-        mean_actions = self.action_net(latent_pi)
-        log_std = torch.clamp(self.log_std, self._LOG_STD_MIN, self._LOG_STD_MAX)
-        return self.action_dist.proba_distribution(mean_actions, log_std)
+from train import AsymmetricActorCriticPolicy, ActorFeaturesExtractor, ACTOR_FEATURES_DIM
 
 
 # ── Optuna-aware validation callback ─────────────────────────────────────────
@@ -81,6 +69,10 @@ class TuningValidationCallback(BaseCallback):
         self.last_val_step = self.num_timesteps
         self._val_count += 1
 
+        # Disable augmentation for clean validation
+        for e in self.training_env.envs:
+            e.unwrapped.training_mode = False
+
         env = self.training_env
         successes = 0
         obs = env.reset()
@@ -94,6 +86,10 @@ class TuningValidationCallback(BaseCallback):
                 info = infos[0]
             if info.get('goal_reached', False):
                 successes += 1
+
+        # Re-enable augmentation after validation
+        for e in self.training_env.envs:
+            e.unwrapped.training_mode = True
 
         val_success_rate = successes / self.val_episodes
         self._success_rates.append(val_success_rate)
@@ -158,7 +154,8 @@ def make_objective(trial_steps, val_interval, density_stage, checkpoint_path, us
             env = ObstacleAvoidanceEnv(ros2_bridge=ros2_bridge)
             return Monitor(env, info_keywords=('goal_reached',))
 
-        env = DummyVecEnv([make_env])
+        raw_env = DummyVecEnv([make_env])
+        env = VecNormalize(raw_env, norm_obs=False, norm_reward=True, gamma=0.99, clip_reward=10.0)
 
         if density_stage > 0:
             for e in env.envs:
@@ -171,7 +168,7 @@ def make_objective(trial_steps, val_interval, density_stage, checkpoint_path, us
             if checkpoint_path:
                 model = PPO.load(
                     checkpoint_path, env=env, device=device,
-                    custom_objects={"policy_class": BoundedStdCnnPolicy}
+                    custom_objects={"policy_class": AsymmetricActorCriticPolicy}
                 )
                 model.learning_rate = lr
                 model.clip_range = clip_range
@@ -183,7 +180,7 @@ def make_objective(trial_steps, val_interval, density_stage, checkpoint_path, us
                 print(f"  Loaded checkpoint: {checkpoint_path}")
             else:
                 model = PPO(
-                    BoundedStdCnnPolicy,
+                    AsymmetricActorCriticPolicy,
                     env,
                     learning_rate=lr,
                     n_steps=n_steps,
@@ -196,7 +193,13 @@ def make_objective(trial_steps, val_interval, density_stage, checkpoint_path, us
                     vf_coef=vf_coef,
                     max_grad_norm=max_grad_norm,
                     target_kl=target_kl,
-                    policy_kwargs={"log_std_init": log_std_init},
+                    policy_kwargs=dict(
+                        features_extractor_class=ActorFeaturesExtractor,
+                        features_extractor_kwargs=dict(features_dim=ACTOR_FEATURES_DIM),
+                        net_arch=dict(pi=[64, 64], vf=[]),
+                        normalize_images=False,
+                        log_std_init=log_std_init,
+                    ),
                     verbose=0,
                     device=device,
                 )

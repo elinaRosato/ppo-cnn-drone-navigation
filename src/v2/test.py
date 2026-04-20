@@ -13,6 +13,7 @@ import argparse
 import numpy as np
 from stable_baselines3 import PPO
 from avoidance_env import ObstacleAvoidanceEnv
+from train import AsymmetricActorCriticPolicy
 
 
 def get_latest_model():
@@ -74,8 +75,9 @@ def test(model_path=None, episodes=5, show_marker=True, use_ros2=False):
             time.sleep(0.1)
 
     env = ObstacleAvoidanceEnv(show_visual_marker=show_marker, ros2_bridge=ros2_bridge)
+    env.training_mode = False
 
-    model = PPO.load(model_path)
+    model = PPO.load(model_path, custom_objects={"policy_class": AsymmetricActorCriticPolicy})
 
     print(f"\nRunning {episodes} test episodes...")
     print("Watch AirSim - red dot = goal position\n")

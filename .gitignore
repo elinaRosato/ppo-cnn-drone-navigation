@@ -23,6 +23,10 @@ models_v2/
 logs_v2/
 models_v3/
 logs_v3/
+models_v4/
+logs_v4/
+models_v5/
+logs_v5/
 
 # Hyperparameter tuning outputs
 *.db
@@ -44,3 +48,4 @@ Thumbs.db
 *.bak
 *.log
 goal_position.txt
+arducam_password.txt

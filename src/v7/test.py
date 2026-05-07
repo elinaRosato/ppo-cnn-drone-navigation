@@ -72,7 +72,9 @@ def find_best_model(base_dir):
     return None
 
 
-def test(model_path=None, episodes=10, use_ros2=False, speed_scale=1, stage=0):
+def test(model_path=None, episodes=10, use_ros2=False, speed_scale=1, stage=0,
+         fwd_speed=1.0, lat_speed=0.8, frame_stride=None, action_momentum=None,
+         hz=None, max_steps=None):
     _here          = os.path.dirname(os.path.abspath(__file__))
     base_model_dir = os.path.join(_here, "../../models_v7")
 
@@ -82,20 +84,36 @@ def test(model_path=None, episodes=10, use_ros2=False, speed_scale=1, stage=0):
             print("No model found in models_v7/. Train first or specify --model.")
             return
 
+    # Resolve relative paths — try CWD first, then repo root (2 levels up from src/v7/)
+    if not os.path.isabs(model_path) and not os.path.exists(model_path):
+        repo_root = os.path.normpath(os.path.join(_here, "../.."))
+        candidate = os.path.join(repo_root, model_path)
+        if os.path.exists(candidate) or os.path.exists(candidate + ".zip"):
+            model_path = candidate
     if not os.path.exists(model_path) and not model_path.endswith(".zip"):
         model_path += ".zip"
 
-    step_hz = 10 * speed_scale
+    step_hz = hz if hz is not None else 10 * speed_scale
+    # Auto-scale max_steps to preserve the same physical corridor distance (30m)
+    if max_steps is None:
+        max_steps = int(round(30 * step_hz / fwd_speed))
 
     print("=" * 70)
     print("GPS-FREE OBSTACLE AVOIDANCE — v7 TEST")
     print("=" * 70)
     print(f"Model:    {model_path}")
     print(f"Episodes: {episodes}")
-    if speed_scale > 1:
+    if hz is not None:
+        print(f"Hz:       {step_hz} Hz  (speed unchanged: {fwd_speed} m/s fwd)")
+    elif speed_scale > 1:
         print(f"Speed:    {speed_scale}× / {step_hz} Hz  (deploy at 1× / 10 Hz)")
     else:
         print(f"Speed:    1× / 10 Hz  (deployment speed)")
+    from avoidance_env import FRAME_STRIDE as _DEFAULT_STRIDE, ACTION_MOMENTUM as _DEFAULT_MOM
+    _stride = frame_stride    if frame_stride    is not None else _DEFAULT_STRIDE
+    _mom    = action_momentum if action_momentum is not None else _DEFAULT_MOM
+    print(f"Fwd:      {fwd_speed} m/s  Lat: {lat_speed} m/s  FrameStride: {_stride}  Momentum: {_mom}")
+    print(f"MaxSteps: {max_steps}  ({max_steps / step_hz:.0f}s timeout @ {step_hz}Hz)")
     print(f"Images:   {'ROS2 bridge' if use_ros2 else 'AirSim Python API'}")
     print("=" * 70)
 
@@ -130,8 +148,13 @@ def test(model_path=None, episodes=10, use_ros2=False, speed_scale=1, stage=0):
         DroneAvoidanceEnv(
             ros2_bridge=ros2_bridge,
             depth_estimator=depth_estimator,
+            fixed_speed=fwd_speed,
+            max_lateral=lat_speed,
             speed_scale=speed_scale,
             step_hz=step_hz,
+            max_steps=max_steps,
+            frame_stride=frame_stride,
+            action_momentum=action_momentum,
         )
     )])
 
@@ -155,8 +178,11 @@ def test(model_path=None, episodes=10, use_ros2=False, speed_scale=1, stage=0):
     ep_lat     = []
     ep_rewards = []
 
+    # Single reset before the loop — DummyVecEnv auto-resets on done=True,
+    # so calling env.reset() inside the loop would cause a double takeoff.
+    obs = env.reset()
+
     for ep in range(episodes):
-        obs       = env.reset()
         done      = False
         total_rew = 0.0
         steps     = 0
@@ -169,6 +195,7 @@ def test(model_path=None, episodes=10, use_ros2=False, speed_scale=1, stage=0):
             steps     += 1
             done       = bool(dones[0])
             last_info  = infos[0]
+        # obs is now the auto-reset observation for the next episode
 
         survived = last_info.get("survived", False)
         collided = last_info.get("collided", False)
@@ -225,8 +252,20 @@ if __name__ == "__main__":
                         help="Use ROS2 bridge for camera images (match training setup)")
     parser.add_argument("--stage",    type=int, default=0, choices=[0, 1, 2],
                         help="Curriculum stage to test at (0=sparse, 1=medium, 2=dense)")
-    parser.add_argument("--fast",     type=int, default=1, choices=[1, 2, 4],
+    parser.add_argument("--fast",      type=int,   default=1, choices=[1, 2, 4],
                         help="Speed multiplier: 2=2×/20Hz, 4=4×/40Hz (1=deploy speed/10Hz)")
+    parser.add_argument("--fwd-speed",    type=float, default=1.0,
+                        help="Forward speed in m/s (default: 1.0)")
+    parser.add_argument("--lat-speed",    type=float, default=0.8,
+                        help="Max lateral speed in m/s (default: 0.8)")
+    parser.add_argument("--frame-stride",    type=int,   default=None,
+                        help="Temporal stride between stacked frames (default: 4, trained value)")
+    parser.add_argument("--action-momentum", type=float, default=None,
+                        help="Lateral action smoothing coefficient (default: 0.3, trained value)")
+    parser.add_argument("--hz",              type=int,   default=None,
+                        help="Control loop frequency in Hz without changing speed (e.g. 40)")
+    parser.add_argument("--max-steps",       type=int,   default=None,
+                        help="Episode step limit (default: auto-scaled to 30m corridor)")
     args = parser.parse_args()
 
     test(
@@ -235,4 +274,10 @@ if __name__ == "__main__":
         use_ros2    = args.ros2,
         speed_scale = args.fast,
         stage       = args.stage,
+        fwd_speed       = args.fwd_speed,
+        lat_speed       = args.lat_speed,
+        frame_stride    = args.frame_stride,
+        action_momentum = args.action_momentum,
+        hz              = args.hz,
+        max_steps       = args.max_steps,
     )

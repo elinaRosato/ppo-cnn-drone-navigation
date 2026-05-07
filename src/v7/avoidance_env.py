@@ -90,6 +90,8 @@ class DroneAvoidanceEnv(gym.Env):
         depth_estimator=None,
         speed_scale=1,
         step_hz=10,
+        frame_stride=None,
+        action_momentum=None,
     ):
         super().__init__()
 
@@ -112,6 +114,8 @@ class DroneAvoidanceEnv(gym.Env):
         self.img_height   = 144    # IMX219 native 4:3 aspect ratio
         self.img_width    = 192
         self.stack_frames = 3
+        self.frame_stride      = frame_stride    if frame_stride    is not None else FRAME_STRIDE
+        self.action_momentum   = action_momentum if action_momentum is not None else ACTION_MOMENTUM
         self.training_mode = True
 
         # Episode state
@@ -152,8 +156,8 @@ class DroneAvoidanceEnv(gym.Env):
         self._episode_altitude = self.cruising_altitude   # jittered in reset()
         self._episode_wind_lat = 0.0                      # ambient lateral wind m/s
 
-        # Strided frame buffer (maxlen covers FRAME_STRIDE*(stack_frames-1)+1 steps = 9)
-        _buf_len = (self.stack_frames - 1) * FRAME_STRIDE + 1
+        # Strided frame buffer (maxlen covers frame_stride*(stack_frames-1)+1 steps)
+        _buf_len = (self.stack_frames - 1) * self.frame_stride + 1
         self._frame_buffer = deque(
             [np.zeros((self.img_height, self.img_width), dtype=np.float32)] * _buf_len,
             maxlen=_buf_len,
@@ -454,7 +458,7 @@ class DroneAvoidanceEnv(gym.Env):
         n   = len(buf)
         frames = []
         for i in range(self.stack_frames - 1, -1, -1):   # 2, 1, 0 → oldest to newest
-            idx = max(0, n - 1 - i * FRAME_STRIDE)
+            idx = max(0, n - 1 - i * self.frame_stride)
             frames.append(buf[idx])
         self.frame_stack = np.stack(frames, axis=0)
 
@@ -645,7 +649,7 @@ class DroneAvoidanceEnv(gym.Env):
         else:
             init_frame = np.zeros((self.img_height, self.img_width), dtype=np.float32)
 
-        _buf_len = (self.stack_frames - 1) * FRAME_STRIDE + 1
+        _buf_len = (self.stack_frames - 1) * self.frame_stride + 1
         self._frame_buffer.clear()
         for _ in range(_buf_len):
             self._frame_buffer.append(init_frame)
@@ -678,8 +682,8 @@ class DroneAvoidanceEnv(gym.Env):
         self._delayed_action = np.array(action, dtype=np.float32)
 
         smoothed = (
-            (1 - ACTION_MOMENTUM) * action_to_exec
-            + ACTION_MOMENTUM     * self.prev_action
+            (1 - self.action_momentum) * action_to_exec
+            + self.action_momentum     * self.prev_action
         )
         self.prev_action = smoothed.copy()
 

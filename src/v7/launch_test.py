@@ -110,9 +110,21 @@ def main():
                         help="Number of test episodes (default: 10)")
     parser.add_argument("--stage",    type=int, default=0, choices=[0, 1, 2],
                         help="Curriculum stage to test at (0=sparse, 1=medium, 2=dense)")
-    parser.add_argument("--fast",     type=int, default=1, choices=[1, 2, 4],
+    parser.add_argument("--fast",      type=int,   default=1, choices=[1, 2, 4],
                         help="Speed multiplier: 2=2×/20Hz, 4=4×/40Hz")
-    parser.add_argument("--ros2",     action="store_true",
+    parser.add_argument("--fwd-speed",    type=float, default=1.0,
+                        help="Forward speed in m/s (default: 1.0)")
+    parser.add_argument("--lat-speed",    type=float, default=0.8,
+                        help="Max lateral speed in m/s (default: 0.8)")
+    parser.add_argument("--frame-stride",    type=int,   default=None,
+                        help="Temporal stride between stacked frames (default: 4, trained value)")
+    parser.add_argument("--action-momentum", type=float, default=None,
+                        help="Lateral action smoothing coefficient (default: 0.3, trained value)")
+    parser.add_argument("--hz",              type=int,   default=None,
+                        help="Control loop frequency in Hz without changing speed (e.g. 40)")
+    parser.add_argument("--max-steps",       type=int,   default=None,
+                        help="Episode step limit (default: auto-scaled to 30m corridor)")
+    parser.add_argument("--ros2",      action="store_true",
                         help="(accepted for consistency — launcher always uses ROS2)")
     args = parser.parse_args()
 
@@ -153,6 +165,18 @@ def main():
         cmd += f" --stage {args.stage}"
     if args.fast > 1:
         cmd += f" --fast {args.fast}"
+    if args.fwd_speed != 1.0:
+        cmd += f" --fwd-speed {args.fwd_speed}"
+    if args.lat_speed != 0.8:
+        cmd += f" --lat-speed {args.lat_speed}"
+    if args.frame_stride is not None:
+        cmd += f" --frame-stride {args.frame_stride}"
+    if args.action_momentum is not None:
+        cmd += f" --action-momentum {args.action_momentum}"
+    if args.hz is not None:
+        cmd += f" --hz {args.hz}"
+    if args.max_steps is not None:
+        cmd += f" --max-steps {args.max_steps}"
 
     print(f"[LAUNCHER] Starting test: {cmd}")
     print("[LAUNCHER] Ctrl+C stops everything.")

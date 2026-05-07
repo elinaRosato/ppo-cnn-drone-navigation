@@ -175,7 +175,7 @@ def build_grid(row0: list, row1: list) -> np.ndarray:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main(fps: int, scene_topic: str, depth_topic: str):
+def main(fps: int, scene_topic: str, depth_topic: str, frame_stride: int = FRAME_STRIDE):
     rclpy.init()
     node = CameraReceiver(scene_topic, depth_topic)
 
@@ -184,10 +184,10 @@ def main(fps: int, scene_topic: str, depth_topic: str):
 
     print("Loading Depth Anything V2 Small...")
     estimator = DepthEstimator(target_size=(IMG_W, IMG_H))
-    print("Estimator ready.")
+    print(f"Estimator ready.  FrameStride: {frame_stride}  (lookback: {(STACK_FRAMES-1)*frame_stride} frames)")
 
     wait_ms    = max(1, int(1000 / fps))
-    _buf_len   = (STACK_FRAMES - 1) * FRAME_STRIDE + 1   # 9
+    _buf_len   = (STACK_FRAMES - 1) * frame_stride + 1
     frame_buf  = deque(
         [np.zeros((IMG_H, IMG_W), dtype=np.float32)] * _buf_len,
         maxlen=_buf_len,
@@ -227,7 +227,7 @@ def main(fps: int, scene_topic: str, depth_topic: str):
         n   = len(buf)
         frames = []
         for i in range(STACK_FRAMES - 1, -1, -1):   # oldest → newest
-            frames.append(buf[max(0, n - 1 - i * FRAME_STRIDE)])
+            frames.append(buf[max(0, n - 1 - i * frame_stride)])
         frame_stack = np.stack(frames, axis=0)
 
         # ── Row 0: raw RGB | augmented RGB | depth+CLAHE | AirSim penalty ─────
@@ -245,7 +245,7 @@ def main(fps: int, scene_topic: str, depth_topic: str):
         stack_tiles = [
             gray_tile(
                 frame_stack[i],
-                f"stack t-{(STACK_FRAMES - 1 - i) * FRAME_STRIDE}"
+                f"stack t-{(STACK_FRAMES - 1 - i) * frame_stride}"
                 + (" (latest)" if i == STACK_FRAMES - 1 else " (oldest)" if i == 0 else ""),
             )
             for i in range(STACK_FRAMES)
@@ -276,8 +276,11 @@ if __name__ == "__main__":
     parser.add_argument('--fps',         type=int,  default=10)
     parser.add_argument('--topic',       type=str,
                         default='/airsim_node/SimpleFlight/front_center_Scene/image')
-    parser.add_argument('--depth-topic', type=str,
+    parser.add_argument('--depth-topic',  type=str,
                         default='/airsim_node/SimpleFlight/front_center_DepthPerspective/image')
+    parser.add_argument('--frame-stride', type=int, default=FRAME_STRIDE,
+                        help=f'Temporal stride between stacked frames (default: {FRAME_STRIDE})')
     args = parser.parse_args()
 
-    main(fps=args.fps, scene_topic=args.topic, depth_topic=args.depth_topic)
+    main(fps=args.fps, scene_topic=args.topic, depth_topic=args.depth_topic,
+         frame_stride=args.frame_stride)
